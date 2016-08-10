@@ -275,13 +275,25 @@ angular.module('am.controllers').controller('SilencesCtrl',
     $scope.showForm = false;
 
     $scope.toggleForm = function() {
-      $scope.showForm = !$scope.showForm
+      $scope.showForm = !$scope.showForm;
     }
 
+    var inflight = false;
     $scope.refresh = function() {
-      Silence.query($location.search(),
+      if (inflight) {
+        return;
+      }
+      inflight = true;
+      var params = $location.search();
+      var id;
+
+      if ($scope.silences.length) {
+        params['lastID'] = $scope.silences[$scope.silences.length-1]['id'];
+      }
+
+      Silence.query(params,
         function(data) {
-          $scope.silences = data.data || [];
+          $scope.silences = $scope.silences.concat(data.data || []);
 
           angular.forEach($scope.silences, function(value) {
             value.endsAt = new Date(value.endsAt);
@@ -291,8 +303,9 @@ angular.module('am.controllers').controller('SilencesCtrl',
         },
         function(data) {
           $scope.error = data.data;
-        }
-      );
+        }).$promise.finally(function() {
+          inflight = false;
+        });
     };
 
     $scope.$on('silence-created', function(evt) {
@@ -311,7 +324,7 @@ angular.module('am.controllers').controller('SilencesCtrl',
       }
     };
 
-    $scope.refresh();
+    // $scope.refresh();
   }
 );
 
@@ -400,11 +413,14 @@ angular.module('am', [
   'ngRoute',
   'ngSanitize',
   'angularMoment',
+  'infinite-scroll',
 
   'am.controllers',
   'am.services',
   'am.directives'
 ]);
+
+angular.module('infinite-scroll').value('THROTTLE_MILLISECONDS', 250)
 
 angular.module('am').config(
   function($routeProvider) {
