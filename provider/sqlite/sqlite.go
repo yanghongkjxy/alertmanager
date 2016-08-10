@@ -3,6 +3,7 @@ package sqlite
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -509,6 +510,13 @@ func (s *Silences) Mutes(lset model.LabelSet) bool {
 	return false
 }
 
+var ErrorNoMoreSilences = errors.New("fewer silences found than requested")
+
+// LimitGet implements the Silences interface.
+func (s *Silences) Query(n uint64, o uint64) ([]*types.Silence, error) {
+	return nil, nil
+}
+
 // All implements the Silences interface.
 func (s *Silences) All() ([]*types.Silence, error) {
 	dbmtx.Lock()
@@ -516,7 +524,7 @@ func (s *Silences) All() ([]*types.Silence, error) {
 
 	rows, err := s.db.Query(`
 		SELECT id, matchers, starts_at, ends_at, created_at, created_by, comment
-		FROM silences 
+		FROM silences
 		ORDER BY starts_at DESC
 	`)
 	if err != nil {

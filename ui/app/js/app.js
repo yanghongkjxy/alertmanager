@@ -268,7 +268,7 @@ angular.module('am.controllers').controller('SilenceCtrl',
 );
 
 angular.module('am.controllers').controller('SilencesCtrl',
-  function($scope, Silence) {
+  function($scope, $location, Silence) {
     $scope.silences = [];
     $scope.order = "endsAt";
 
@@ -279,7 +279,7 @@ angular.module('am.controllers').controller('SilencesCtrl',
     }
 
     $scope.refresh = function() {
-      Silence.query({},
+      Silence.query($location.search(),
         function(data) {
           $scope.silences = data.data || [];
 
@@ -391,7 +391,7 @@ angular.module('am.controllers').controller('StatusCtrl',
         $scope.uptime = data.data.uptime;
       },
       function(data) {
-        console.log(data.data); 
+        console.log(data.data);
       })
   }
 );

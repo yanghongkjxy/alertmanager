@@ -102,6 +102,10 @@ type Silences interface {
 	Del(uint64) error
 	// Get a silence associated with a fingerprint.
 	Get(uint64) (*types.Silence, error)
+	// Get at most n silences starting at o offset. Returns
+	// ErrorNoMoreSilences and silences if n exceeds number of silences
+	// found.
+	Query(n uint64, o uint64) ([]*types.Silence, error)
 }
 
 // Notifies provides information about pending and successful

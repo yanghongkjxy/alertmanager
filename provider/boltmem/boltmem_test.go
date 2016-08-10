@@ -278,6 +278,154 @@ func TestSilencesAll(t *testing.T) {
 	}
 }
 
+func testNewSilences(t *testing.T, dir string) *Silences {
+	dir, err := ioutil.TempDir("", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	silences, err := NewSilences(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return silences
+}
+
+func TestSilencesQuery(t *testing.T) {
+	var (
+		t0       = time.Now()
+		silences = testNewSilences(t, "silences_test")
+	)
+
+	n := 500
+	insert := make([]*types.Silence, n)
+	for i := 0; i < n; i++ {
+		insert[i] = createNewSilence(t, silences, t0, i)
+	}
+
+	pairs := []queryPair{
+		queryPair{
+			n:      10,
+			offset: 0,
+		},
+		queryPair{
+			n:      10,
+			offset: 2,
+		},
+		queryPair{
+			n:      100,
+			offset: 4,
+		},
+	}
+
+	for _, p := range pairs {
+		res, err := silences.Query(p.n, p.offset)
+		if err != nil {
+			t.Fatalf("Retrieval failed: %s", err)
+		}
+
+		start := p.offset * defaultPageSize
+		end := start + p.n
+		if end > uint64(n) {
+			t.Fatalf("your test data doesn't include the range you're requesting: insert[%d:%d] (max index %d)", start, end, n)
+		}
+		expected := append([]*types.Silence{}, insert[start:end]...)
+		if silenceListEqual(res, expected) {
+			t.Errorf("Unexpected result")
+			t.Fatalf(pretty.Compare(res, expected))
+		}
+	}
+}
+
+func TestSilencesQueryTooManyRequested(t *testing.T) {
+	var (
+		t0       = time.Now()
+		silences = testNewSilences(t, "silences_test")
+	)
+
+	n := 50
+	insert := make([]*types.Silence, n)
+	for i := 0; i < n; i++ {
+		insert[i] = createNewSilence(t, silences, t0, i)
+	}
+
+	res, err := silences.Query(uint64(n*2), 0)
+	if err != nil {
+		t.Fatalf("Retrieval failed: %s", err)
+	}
+
+	if len(res) != n {
+		t.Fatalf("incorrect silences length: wanted %d, got %d", n, len(res))
+	}
+}
+
+func TestSilencesQueryTooHighOffset(t *testing.T) {
+	var (
+		t0       = time.Now()
+		silences = testNewSilences(t, "silences_test")
+	)
+
+	n := 50
+	insert := make([]*types.Silence, n)
+	for i := 0; i < n; i++ {
+		insert[i] = createNewSilence(t, silences, t0, i)
+	}
+
+	res, err := silences.Query(uint64(n*2), 20)
+	if err != nil {
+		t.Fatalf("Retrieval failed: %s", err)
+	}
+
+	if len(res) != 0 {
+		t.Fatalf("incorrect silences length: wanted %d, got %d", n, len(res))
+	}
+}
+
+func createNewSilence(t *testing.T, s *Silences, t0 time.Time, i int) *types.Silence {
+	sil := types.NewSilence(&model.Silence{
+		Matchers: []*model.Matcher{
+			{Name: "key", Value: "val"},
+		},
+		StartsAt:  t0.Add(time.Duration(i) * time.Minute),
+		EndsAt:    t0.Add((time.Duration(i) + 1) * time.Minute),
+		CreatedAt: t0.Add(time.Duration(i) * time.Minute),
+		CreatedBy: "user",
+		Comment:   "another test comment",
+	})
+	uid, err := s.Set(sil)
+	if err != nil {
+		t.Fatalf("Insert failed: %s", err)
+	}
+	sil.ID = uid
+	return sil
+}
+
+type queryPair struct {
+	n, offset uint64
+}
+
+func alertsEqual(a1, a2 *types.Alert) bool {
+	if !reflect.DeepEqual(a1.Labels, a2.Labels) {
+		return false
+	}
+	if !reflect.DeepEqual(a1.Annotations, a2.Annotations) {
+		return false
+	}
+	if a1.GeneratorURL != a2.GeneratorURL {
+		return false
+	}
+	if !a1.StartsAt.Equal(a2.StartsAt) {
+		return false
+	}
+	if !a1.EndsAt.Equal(a2.EndsAt) {
+		return false
+	}
+	if !a1.UpdatedAt.Equal(a2.UpdatedAt) {
+		return false
+	}
+	return a1.Timeout == a2.Timeout
+}
+
 func TestSilencesMutes(t *testing.T) {
 	var (
 		t0 = time.Now()
@@ -463,28 +611,6 @@ func TestAlertsPut(t *testing.T) {
 			t.Fatalf(pretty.Compare(res, a))
 		}
 	}
-}
-
-func alertsEqual(a1, a2 *types.Alert) bool {
-	if !reflect.DeepEqual(a1.Labels, a2.Labels) {
-		return false
-	}
-	if !reflect.DeepEqual(a1.Annotations, a2.Annotations) {
-		return false
-	}
-	if a1.GeneratorURL != a2.GeneratorURL {
-		return false
-	}
-	if !a1.StartsAt.Equal(a2.StartsAt) {
-		return false
-	}
-	if !a1.EndsAt.Equal(a2.EndsAt) {
-		return false
-	}
-	if !a1.UpdatedAt.Equal(a2.UpdatedAt) {
-		return false
-	}
-	return a1.Timeout == a2.Timeout
 }
 
 func alertListEqual(a1, a2 []*types.Alert) bool {

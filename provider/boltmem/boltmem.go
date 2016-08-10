@@ -206,6 +206,7 @@ type Silences struct {
 
 	mtx   sync.RWMutex
 	cache map[uint64]*types.Silence
+	keys  []uint64
 }
 
 // NewSilences creates a new Silences provider.
@@ -225,6 +226,7 @@ func NewSilences(path string, mk types.Marker) (*Silences, error) {
 		db:    db,
 		mk:    mk,
 		cache: map[uint64]*types.Silence{},
+		keys:  make([]uint64, 0),
 	}
 	return s, s.initCache()
 }
@@ -256,16 +258,41 @@ func (s *Silences) Mutes(lset model.LabelSet) bool {
 	return false
 }
 
-// All returns all existing silences.
-func (s *Silences) All() ([]*types.Silence, error) {
+const defaultPageSize uint64 = 25
+
+// Query implements the Silences interface.
+func (s *Silences) Query(n uint64, o uint64) ([]*types.Silence, error) {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
 
-	res := make([]*types.Silence, 0, len(s.cache))
-	for _, s := range s.cache {
-		res = append(res, s)
+	if uint64(len(s.keys)) < n {
+		n = uint64(len(s.keys))
+	}
+
+	pageStart := defaultPageSize * o
+	if pageStart > uint64(len(s.keys)) {
+		return []*types.Silence{}, nil
+	}
+
+	res := make([]*types.Silence, n, n)
+
+	i := 0
+	for _, id := range s.keys[pageStart : pageStart+n] {
+		// We control the cache and the key so they shouldn't ever be
+		// out of sync, i.e. we don't need to worry about existence
+		// checks on the cache
+
+		// Make sure this res[i] business is kosher and won't index out
+		// of bounds. Like with a test.
+		res[i] = s.cache[id]
+		i++
 	}
 	return res, nil
+}
+
+// All returns all existing silences.
+func (s *Silences) All() ([]*types.Silence, error) {
+	return s.Query(uint64(len(s.cache)), 0)
 }
 
 func (s *Silences) initCache() error {
@@ -284,6 +311,7 @@ func (s *Silences) initCache() error {
 			// The ID is duplicated in the value and always equal
 			// to the stored key.
 			s.cache[ms.ID] = types.NewSilence(&ms)
+			s.keys = append(s.keys, ms.ID)
 		}
 
 		return nil
@@ -323,6 +351,7 @@ func (s *Silences) Set(sil *types.Silence) (uint64, error) {
 		return 0, err
 	}
 	s.cache[uid] = sil
+	s.keys = append(s.keys, uid)
 	return uid, nil
 }
 
@@ -343,6 +372,16 @@ func (s *Silences) Del(uid uint64) error {
 		return err
 	}
 	delete(s.cache, uid)
+	// TODO: Yes, do a binary search, but even for 5000 keys this will
+	// still be pretty fast.
+	var j int
+	for i, id := range s.keys {
+		if id == uid {
+			j = i
+			break
+		}
+	}
+	s.keys = append(s.keys[:j], s.keys[j+1:]...)
 	return nil
 }
 
