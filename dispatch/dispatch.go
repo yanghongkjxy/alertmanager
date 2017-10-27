@@ -6,7 +6,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/prometheus/common/log"
+	"github.com/go-kit/kit/log"
+	"github.com/go-kit/kit/log/level"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"golang.org/x/net/context"
@@ -33,7 +34,7 @@ type Dispatcher struct {
 	ctx    context.Context
 	cancel func()
 
-	log log.Logger
+	logger log.Logger
 }
 
 // NewDispatcher returns a new Dispatcher.
@@ -43,6 +44,7 @@ func NewDispatcher(
 	s notify.Stage,
 	mk types.Marker,
 	to func(time.Duration) time.Duration,
+	l log.Logger,
 ) *Dispatcher {
 	disp := &Dispatcher{
 		alerts:  ap,
@@ -50,7 +52,7 @@ func NewDispatcher(
 		route:   r,
 		marker:  mk,
 		timeout: to,
-		log:     log.With("component", "dispatcher"),
+		logger:  log.With(l, "component", "dispatcher"),
 	}
 	return disp
 }
@@ -80,7 +82,9 @@ type AlertBlock struct {
 // annotated with silencing and inhibition info.
 type APIAlert struct {
 	*model.Alert
-	Status types.AlertStatus `json:"status"`
+	Status      types.AlertStatus `json:"status"`
+	Receivers   []string          `json:"receivers"`
+	Fingerprint string            `json:"fingerprint"`
 }
 
 // AlertGroup is a list of alert blocks grouped by the same label set.
@@ -135,8 +139,9 @@ func (d *Dispatcher) Groups(matchers []*labels.Matcher) AlertOverview {
 				}
 				status := d.marker.Status(a.Fingerprint())
 				aa := &APIAlert{
-					Alert:  a,
-					Status: status,
+					Alert:       a,
+					Status:      status,
+					Fingerprint: a.Fingerprint().String(),
 				}
 
 				if !matchesFilterLabels(aa, matchers) {
@@ -175,16 +180,16 @@ func (d *Dispatcher) run(it provider.AlertIterator) {
 			if !ok {
 				// Iterator exhausted for some reason.
 				if err := it.Err(); err != nil {
-					log.Errorf("Error on alert update: %s", err)
+					level.Error(d.logger).Log("msg", "Error on alert update", "err", err)
 				}
 				return
 			}
 
-			d.log.With("alert", alert).Debug("Received alert")
+			level.Debug(d.logger).Log("msg", "Received alert", "alert", alert)
 
 			// Log errors but keep trying.
 			if err := it.Err(); err != nil {
-				log.Errorf("Error on alert update: %s", err)
+				level.Error(d.logger).Log("msg", "Error on alert update", "err", err)
 				continue
 			}
 
@@ -252,13 +257,13 @@ func (d *Dispatcher) processAlert(alert *types.Alert, route *Route) {
 	// If the group does not exist, create it.
 	ag, ok := groups[fp]
 	if !ok {
-		ag = newAggrGroup(d.ctx, group, route, d.timeout)
+		ag = newAggrGroup(d.ctx, group, route, d.timeout, d.logger)
 		groups[fp] = ag
 
 		go ag.run(func(ctx context.Context, alerts ...*types.Alert) bool {
-			_, _, err := d.stage.Exec(ctx, alerts...)
+			_, _, err := d.stage.Exec(ctx, d.logger, alerts...)
 			if err != nil {
-				log.Errorf("Notify for %d alerts failed: %s", len(alerts), err)
+				level.Error(d.logger).Log("msg", "Notify for alerts failed", "num_alerts", len(alerts), "err", err)
 			}
 			return err == nil
 		})
@@ -273,7 +278,7 @@ func (d *Dispatcher) processAlert(alert *types.Alert, route *Route) {
 type aggrGroup struct {
 	labels   model.LabelSet
 	opts     *RouteOpts
-	log      log.Logger
+	logger   log.Logger
 	routeKey string
 
 	ctx     context.Context
@@ -288,7 +293,7 @@ type aggrGroup struct {
 }
 
 // newAggrGroup returns a new aggregation group.
-func newAggrGroup(ctx context.Context, labels model.LabelSet, r *Route, to func(time.Duration) time.Duration) *aggrGroup {
+func newAggrGroup(ctx context.Context, labels model.LabelSet, r *Route, to func(time.Duration) time.Duration, logger log.Logger) *aggrGroup {
 	if to == nil {
 		to = func(d time.Duration) time.Duration { return d }
 	}
@@ -301,7 +306,7 @@ func newAggrGroup(ctx context.Context, labels model.LabelSet, r *Route, to func(
 	}
 	ag.ctx, ag.cancel = context.WithCancel(ctx)
 
-	ag.log = log.With("aggrGroup", ag)
+	ag.logger = log.With(logger, "aggrGroup", ag)
 
 	// Set an initial one-time wait before flushing
 	// the first batch of notifications.
@@ -422,7 +427,7 @@ func (ag *aggrGroup) flush(notify func(...*types.Alert) bool) {
 
 	ag.mtx.Unlock()
 
-	ag.log.Debugln("flushing", alertsSlice)
+	level.Debug(ag.logger).Log("msg", "Flushing", "alerts", fmt.Sprintf("%v", alertsSlice))
 
 	if notify(alertsSlice...) {
 		ag.mtx.Lock()

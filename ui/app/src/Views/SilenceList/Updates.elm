@@ -1,14 +1,15 @@
 module Views.SilenceList.Updates exposing (update, urlUpdate)
 
+import Navigation
 import Silences.Api as Api
-import Views.SilenceList.Types exposing (SilenceListMsg(..), Model)
-import Utils.Types as Types exposing (ApiData(Failure, Loading, Success), Time, Matchers)
 import Utils.Filter exposing (Filter, generateQueryString)
+import Utils.Types as Types exposing (ApiData(Failure, Loading, Success), Matchers, Time)
 import Views.FilterBar.Updates as FilterBar
+import Views.SilenceList.Types exposing (Model, SilenceListMsg(..))
 
 
-update : SilenceListMsg -> Model -> Filter -> ( Model, Cmd SilenceListMsg )
-update msg model filter =
+update : SilenceListMsg -> Model -> Filter -> String -> String -> ( Model, Cmd SilenceListMsg )
+update msg model filter basePath apiUrl =
     case msg of
         SilencesFetch sils ->
             ( { model | silences = sils }, Cmd.none )
@@ -17,21 +18,31 @@ update msg model filter =
             ( { model
                 | filterBar = FilterBar.setMatchers filter model.filterBar
                 , silences = Loading
+                , showConfirmationDialog = False
               }
-            , Api.getSilences filter SilencesFetch
+            , Api.getSilences apiUrl filter SilencesFetch
             )
 
-        DestroySilence silence ->
+        ConfirmDestroySilence silence refresh ->
+            ( { model | showConfirmationDialog = True }
+            , Cmd.none
+            )
+
+        DestroySilence silence refresh ->
             -- TODO: "Deleted id: ID" growl
             -- TODO: Check why POST isn't there but is accepted
-            ( { model | silences = Loading }
-            , Api.destroy silence (always FetchSilences)
-            )
+            { model | silences = Loading, showConfirmationDialog = False }
+                ! [ Api.destroy apiUrl silence (always FetchSilences)
+                  , if refresh then
+                        Navigation.newUrl (basePath ++ "#/silences")
+                    else
+                        Cmd.none
+                  ]
 
         MsgForFilterBar msg ->
             let
                 ( filterBar, cmd ) =
-                    FilterBar.update "/#/silences" filter msg model.filterBar
+                    FilterBar.update (basePath ++ "#/silences") filter msg model.filterBar
             in
                 ( { model | filterBar = filterBar }, Cmd.map MsgForFilterBar cmd )
 
@@ -48,6 +59,7 @@ updateFilter : Maybe String -> Filter
 updateFilter maybeFilter =
     { receiver = Nothing
     , showSilenced = Nothing
+    , showInhibited = Nothing
     , group = Nothing
     , text = maybeFilter
     }

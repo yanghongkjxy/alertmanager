@@ -1,16 +1,16 @@
 module Status.Api exposing (getStatus)
 
-import Utils.Api exposing (baseUrl, send, get)
+import Utils.Api exposing (send, get)
 import Utils.Types exposing (ApiData)
 import Status.Types exposing (StatusResponse, VersionInfo, MeshStatus, MeshPeer)
-import Json.Decode exposing (Decoder, map2, string, field, at, list, int)
+import Json.Decode exposing (Decoder, map2, string, field, at, list, int, maybe)
 
 
-getStatus : (ApiData StatusResponse -> msg) -> Cmd msg
-getStatus msg =
+getStatus : String -> (ApiData StatusResponse -> msg) -> Cmd msg
+getStatus apiUrl msg =
     let
         url =
-            String.join "/" [ baseUrl, "status" ]
+            String.join "/" [ apiUrl, "status" ]
 
         request =
             get url decodeStatusResponse
@@ -26,10 +26,10 @@ decodeStatusResponse =
 decodeData : Decoder StatusResponse
 decodeData =
     Json.Decode.map4 StatusResponse
-        (field "config" string)
+        (field "configYAML" string)
         (field "uptime" string)
         (field "versionInfo" decodeVersionInfo)
-        (field "meshStatus" decodeMeshStatus)
+        (field "meshStatus" (maybe decodeMeshStatus))
 
 
 decodeVersionInfo : Decoder VersionInfo

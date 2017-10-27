@@ -1,17 +1,20 @@
 module Views.AlertList.Types exposing (AlertListMsg(..), Model, Tab(..), initAlertList)
 
-import Utils.Types exposing (ApiData(Initial))
 import Alerts.Types exposing (Alert)
+import Utils.Types exposing (ApiData(Initial))
 import Views.FilterBar.Types as FilterBar
 import Views.GroupBar.Types as GroupBar
+import Views.ReceiverBar.Types as ReceiverBar
 
 
 type AlertListMsg
     = AlertsFetched (ApiData (List Alert))
     | FetchAlerts
+    | MsgForReceiverBar ReceiverBar.Msg
     | MsgForFilterBar FilterBar.Msg
     | MsgForGroupBar GroupBar.Msg
     | ToggleSilenced Bool
+    | ToggleInhibited Bool
     | SetActive (Maybe String)
     | SetTab Tab
 
@@ -23,6 +26,7 @@ type Tab
 
 type alias Model =
     { alerts : ApiData (List Alert)
+    , receiverBar : ReceiverBar.Model
     , groupBar : GroupBar.Model
     , filterBar : FilterBar.Model
     , tab : Tab
@@ -33,6 +37,7 @@ type alias Model =
 initAlertList : Model
 initAlertList =
     { alerts = Initial
+    , receiverBar = ReceiverBar.initReceiverBar
     , groupBar = GroupBar.initGroupBar
     , filterBar = FilterBar.initFilterBar
     , tab = FilterTab

@@ -24,8 +24,9 @@ import Set
 type alias Filter =
     { text : Maybe String
     , group : Maybe String
-    , receiver : Maybe Matcher
+    , receiver : Maybe String
     , showSilenced : Maybe Bool
+    , showInhibited : Maybe Bool
     }
 
 
@@ -35,6 +36,7 @@ nullFilter =
     , group = Nothing
     , receiver = Nothing
     , showSilenced = Nothing
+    , showInhibited = Nothing
     }
 
 
@@ -44,12 +46,13 @@ generateQueryParam name =
 
 
 generateQueryString : Filter -> String
-generateQueryString { receiver, showSilenced, text, group } =
+generateQueryString { receiver, showSilenced, showInhibited, text, group } =
     let
-        -- TODO: Re-add receiver once it is parsed on the server side.
         parts =
             [ ( "silenced", Maybe.withDefault False showSilenced |> toString |> String.toLower |> Just )
+            , ( "inhibited", Maybe.withDefault False showInhibited |> toString |> String.toLower |> Just )
             , ( "filter", emptyToNothing text )
+            , ( "receiver", emptyToNothing receiver )
             , ( "group", group )
             ]
                 |> List.filterMap (uncurry generateQueryParam)

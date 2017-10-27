@@ -18,7 +18,8 @@ alerts1='[
      },
      "annotations": {
         "info": "The disk sda2 is running full",
-        "summary": "please check the instance example1"
+        "summary": "please check the instance example1",
+        "runbook": "the following link http://test-url should be clickable"
       }
   },
   {
@@ -47,7 +48,16 @@ alerts1='[
     "labels": {
        "alertname": "DiskRunningFull",
        "dev": "sda1",
-       "instance": "example3"
+       "instance": "example3",
+       "severity": "critical"
+     }
+  },
+  {
+    "labels": {
+       "alertname": "DiskRunningFull",
+       "dev": "sda1",
+       "instance": "example3",
+       "severity": "warning"
      }
   }
 ]'

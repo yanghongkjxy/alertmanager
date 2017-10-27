@@ -1,42 +1,43 @@
 module Views.AlertList.Views exposing (view)
 
-import Alerts.Types exposing (Alert, AlertGroup, Block)
+import Alerts.Types exposing (Alert)
 import Html exposing (..)
 import Html.Attributes exposing (..)
 import Html.Events exposing (..)
 import Types exposing (Msg(Noop, CreateSilenceFromAlert, MsgForAlertList))
 import Utils.Filter exposing (Filter)
 import Views.FilterBar.Views as FilterBar
+import Views.ReceiverBar.Views as ReceiverBar
 import Utils.Types exposing (ApiData(Initial, Success, Loading, Failure), Labels)
 import Utils.Views
 import Utils.List
 import Views.AlertList.AlertView as AlertView
 import Views.GroupBar.Types as GroupBar
-import Views.AlertList.Types exposing (AlertListMsg(MsgForFilterBar, MsgForGroupBar, SetTab, ToggleSilenced), Model, Tab(..))
+import Views.AlertList.Types exposing (AlertListMsg(..), Model, Tab(..))
 import Types exposing (Msg(Noop, CreateSilenceFromAlert, MsgForAlertList))
 import Views.GroupBar.Views as GroupBar
 import Dict exposing (Dict)
 
 
-renderSilenced : Maybe Bool -> Html Msg
-renderSilenced maybeShowSilenced =
-    li [ class "nav-item ml-auto " ]
-        [ label [ class "mt-1 custom-control custom-checkbox" ]
+renderCheckbox : String -> Maybe Bool -> (Bool -> AlertListMsg) -> Html Msg
+renderCheckbox textLabel maybeShowSilenced toggleMsg =
+    li [ class "nav-item" ]
+        [ label [ class "mt-1 ml-1 custom-control custom-checkbox" ]
             [ input
                 [ type_ "checkbox"
                 , class "custom-control-input"
                 , checked (Maybe.withDefault False maybeShowSilenced)
-                , onCheck (ToggleSilenced >> MsgForAlertList)
+                , onCheck (toggleMsg >> MsgForAlertList)
                 ]
                 []
             , span [ class "custom-control-indicator" ] []
-            , span [ class "custom-control-description" ] [ text "Show Silenced" ]
+            , span [ class "custom-control-description" ] [ text textLabel ]
             ]
         ]
 
 
 view : Model -> Filter -> Html Msg
-view { alerts, groupBar, filterBar, tab, activeId } filter =
+view { alerts, groupBar, filterBar, receiverBar, tab, activeId } filter =
     div []
         [ div
             [ class "card mb-5" ]
@@ -44,7 +45,11 @@ view { alerts, groupBar, filterBar, tab, activeId } filter =
                 [ ul [ class "nav nav-tabs card-header-tabs" ]
                     [ Utils.Views.tab FilterTab tab (SetTab >> MsgForAlertList) [ text "Filter" ]
                     , Utils.Views.tab GroupTab tab (SetTab >> MsgForAlertList) [ text "Group" ]
-                    , renderSilenced filter.showSilenced
+                    , receiverBar
+                        |> ReceiverBar.view filter.receiver
+                        |> Html.map (MsgForReceiverBar >> MsgForAlertList)
+                    , renderCheckbox "Silenced" filter.showSilenced ToggleSilenced
+                    , renderCheckbox "Inhibited" filter.showInhibited ToggleInhibited
                     ]
                 ]
             , div [ class "card-block" ]
@@ -72,12 +77,12 @@ view { alerts, groupBar, filterBar, tab, activeId } filter =
 
 
 alertGroups : Maybe String -> Filter -> GroupBar.Model -> List Alert -> Html Msg
-alertGroups activeId filter groupBar alerts =
+alertGroups activeId filter { fields } alerts =
     let
         grouped =
             alerts
                 |> Utils.List.groupBy
-                    (.labels >> List.filter (\( key, _ ) -> List.member key groupBar.fields))
+                    (.labels >> List.filter (\( key, _ ) -> List.member key fields))
     in
         grouped
             |> Dict.keys
@@ -89,6 +94,12 @@ alertGroups activeId filter groupBar alerts =
                         (alertList activeId labels filter)
                         (Dict.get labels grouped)
                 )
+            |> (\list ->
+                    if List.isEmpty list then
+                        [ Utils.Views.error "No alerts found" ]
+                    else
+                        list
+               )
             |> div []
 
 
@@ -103,13 +114,26 @@ alertList activeId labels filter alerts =
                 _ ->
                     List.map
                         (\( key, value ) ->
-                            span [ class "btn btn-info mr-1 mb-3" ]
-                                [ text (key ++ "=\"" ++ value ++ "\"") ]
+                            div [ class "btn-group mr-1 mb-3" ]
+                                [ span
+                                    [ class "btn text-muted"
+                                    , style
+                                        [ ( "user-select", "initial" )
+                                        , ( "-moz-user-select", "initial" )
+                                        , ( "-webkit-user-select", "initial" )
+                                        , ( "border-color", "#5bc0de" )
+                                        ]
+                                    ]
+                                    [ text (key ++ "=\"" ++ value ++ "\"") ]
+                                , button
+                                    [ class "btn btn-outline-info"
+                                    , onClick (AlertView.addLabelMsg ( key, value ))
+                                    , title "Filter by this label"
+                                    ]
+                                    [ text "+" ]
+                                ]
                         )
                         labels
             )
-        , if List.isEmpty alerts then
-            div [] [ text "no alerts found" ]
-          else
-            ul [ class "list-group mb-4" ] (List.map (AlertView.view labels activeId) alerts)
+        , ul [ class "list-group mb-4" ] (List.map (AlertView.view labels activeId) alerts)
         ]

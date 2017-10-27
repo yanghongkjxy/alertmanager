@@ -4,6 +4,7 @@ import Html exposing (..)
 import Html.Attributes exposing (..)
 import Html.Events exposing (onCheck, onInput, onClick, onBlur)
 import Utils.FormValidation exposing (ValidationState(..), ValidatedField)
+import Utils.String
 
 
 tab : tab -> tab -> (tab -> msg) -> List (Html msg) -> Html msg
@@ -21,7 +22,13 @@ labelButton maybeMsg labelText =
     case maybeMsg of
         Nothing ->
             span
-                [ class "btn btn-sm bg-faded btn-secondary mr-2 mb-2" ]
+                [ class "btn btn-sm bg-faded btn-secondary mr-2 mb-2"
+                , style
+                    [ ( "user-select", "text" )
+                    , ( "-moz-user-select", "text" )
+                    , ( "-webkit-user-select", "text" )
+                    ]
+                ]
                 [ text labelText ]
 
         Just msg ->
@@ -30,6 +37,20 @@ labelButton maybeMsg labelText =
                 , onClick msg
                 ]
                 [ span [ class "text-muted" ] [ text labelText ] ]
+
+
+linkifyText : String -> List (Html msg)
+linkifyText str =
+    List.map
+        (\result ->
+            case result of
+                Ok link ->
+                    a [ href link, target "_blank" ] [ text link ]
+
+                Err txt ->
+                    text txt
+        )
+        (Utils.String.linkify str)
 
 
 iconButtonMsg : String -> String -> msg -> Html msg
@@ -126,6 +147,5 @@ loading =
 
 error : String -> Html msg
 error err =
-    div []
-        [ p [] [ text <| "Error: " ++ err ]
-        ]
+    div [ class "alert alert-warning" ]
+        [ text (Utils.String.capitalizeFirst err) ]

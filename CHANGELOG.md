@@ -1,14 +1,67 @@
-## v0.7.0-rc.0 / 2017-05-19
+## 0.9.1 / 2017-09-29
+* [BUGFIX] Fix -web.external-url regression in ui (#1008)
+* [BUGFIX] Fix multipart email implementation (#1009)
+
+## 0.9.0 / 2017-09-28
+* [ENHANCEMENT] Add current time to webhook message (#909)
+* [ENHANCEMENT] Add link_names to slack notifier (#912)
+* [ENHANCEMENT] Make ui labels selectable/highlightable (#932)
+* [ENHANCEMENT] Make links in ui annotations selectable (#946)
+* [ENHANCEMENT] Expose the alert's "fingerprint" (unique identifier) through API (#786)
+* [ENHANCEMENT] Add README information for amtool (#939)
+* [ENHANCEMENT] Use user-set logging option consistently throughout alertmanager (#968)
+* [ENHANCEMENT] Sort alerts returned from API by their fingerprint (#969)
+* [ENHANCEMENT] Add edit/delete silence buttons on silence page view (#970)
+* [ENHANCEMENT] Add check-config subcommand to amtool (#978)
+* [ENHANCEMENT] Add email notification text content support (#934)
+* [ENHANCEMENT] Support passing binary name to make build target (#990)
+* [ENHANCEMENT] Show total no. of silenced alerts in preview (#994)
+* [ENHANCEMENT] Added confirmation dialog when expiring silences (#993)
+* [BUGFIX] Fix crash when no mesh router is configured (#919)
+* [BUGFIX] Render status page without mesh (#920)
+* [BUGFIX] Exit amtool subcommands with non-zero error code (#938)
+* [BUGFIX] Change mktemp invocation in makefile to work for macOS (#971)
+* [BUGFIX] Add a mutex to silences.go:gossipData (#984)
+* [BUGFIX] silences: avoid deadlock (#995)
+* [BUGFIX] Ignore expired silences OnGossip (#999)
+
+## 0.8.0 / 2017-07-20
+
+* [FEATURE] Add ability to filter alerts by receiver in the UI (#890)
+* [FEATURE] Add User-Agent for webhook requests (#893)
+* [ENHANCEMENT] Add possibility to have a global victorops api_key (#897)
+* [ENHANCEMENT] Add EntityDisplayName and improve StateMessage for Victorops
+  (#769)
+* [ENHANCEMENT] Omit empty config fields and show regex upon re-marshalling to
+  elide secrets (#864)
+* [ENHANCEMENT] Parse API error messages in UI (#866)
+* [ENHANCEMENT] Enable sending mail via smtp port 465 (#704)
+* [BUGFIX] Prevent duplicate notifications by sorting matchers (#882)
+* [BUGFIX] Remove timeout for UI requests (#890)
+* [BUGFIX] Update config file location of CLI in flag usage text (#895)
+
+## 0.7.1 / 2017-06-09
+
+* [BUGFIX] Fix filtering by label on Alert list and Silence list page
+
+## 0.7.0 / 2017-06-08
 
 * [CHANGE] Rewrite UI from scratch improving UX
+* [CHANGE] Rename `config` to `configYAML` on `api/v1/status`
 * [FEATURE] Add ability to update a silence on `api/v1/silences` POST endpoint (See #765)
 * [FEATURE] Return alert status on `api/v1/alerts` GET endpoint
 * [FEATURE] Serve silence state on `api/v1/silences` GET endpoint
+* [FEATURE] Add ability to specify a route prefix
+* [FEATURE] Add option to disable AM listening on mesh port
 * [ENHANCEMENT] Add ability to specify `filter` string and `silenced` flag on `api/v1/alerts` GET endpoint
 * [ENHANCEMENT] Update `cache-control` to prevent caching for web assets in general.
+* [ENHANCEMENT] Serve web assets by alertmanager instead of external CDN (See #846)
+* [ENHANCEMENT] Elide secrets in alertmanager config (See #840)
+* [ENHANCEMENT] AMTool: Move config file to a more consistent location (See #843)
 * [BUGFIX] Enable builds for Solaris/Illumos
+* [BUGFIX] Load web assets based on url path (See #323)
 
-## v0.6.2 / 2017-05-09
+## 0.6.2 / 2017-05-09
 
 * [BUGFIX] Correctly link to silences from alert again
 * [BUGFIX] Correctly hide silenced/show active alerts in UI again
@@ -19,13 +72,13 @@
 * [CHANGE] Anchor silence regex matchers to be consistent with Prometheus
 * [ENHANCEMENT] Error if root route is using `continue` keyword
 
-## v0.6.1 / 2017-04-28
+## 0.6.1 / 2017-04-28
 
 * [BUGFIX] Fix incorrectly serialized hash for notification providers.
 * [ENHANCEMENT] Add processing status field to alerts.
 * [FEATURE] Add config hash metric.
 
-## v0.6.0 / 2017-04-25
+## 0.6.0 / 2017-04-25
 
 * [BUGFIX] Add `groupKey` to `alerts/groups` endpoint https://github.com/prometheus/alertmanager/pull/576
 * [BUGFIX] Only notify on firing alerts https://github.com/prometheus/alertmanager/pull/595
@@ -42,13 +95,13 @@
 * [FEATURE] Allow label-based filtering alerts/silences through API https://github.com/prometheus/alertmanager/pull/633
 * [FEATURE] Add commandline tool for interacting with alertmanager https://github.com/prometheus/alertmanager/pull/636
 
-## v0.5.1 / 2016-11-24
+## 0.5.1 / 2016-11-24
 
 * [BUGFIX] Fix crash caused by race condition in silencing
 * [ENHANCEMENT] Improve logging of API errors
 * [ENHANCEMENT] Add metrics for the notification log
 
-## v0.5.0 / 2016-11-01
+## 0.5.0 / 2016-11-01
 
 This release requires a storage wipe. It contains fundamental internal
 changes that came with implementing the high availability mode.
@@ -58,12 +111,12 @@ changes that came with implementing the high availability mode.
 * [CHANGE] New storage format
 * [CHANGE] Stricter silence semantics for consistent historical view
 
-## v0.4.2 / 2016-09-02
+## 0.4.2 / 2016-09-02
 
 * [BUGFIX] Fix broken regex checkbox in silence form
 * [BUGFIX] Simplify inconsistent silence update behavior
 
-## v0.4.1 / 2016-08-31
+## 0.4.1 / 2016-08-31
 
 * [BUGFIX] Wait for silence query to finish instead of showing error
 * [BUGFIX] Fix sorting of silences
@@ -71,7 +124,7 @@ changes that came with implementing the high availability mode.
 * [BUGFIX] Fix styling of silences
 * [ENHANCEMENT] Provide cleaner API silence interface
 
-## v0.4.0 / 2016-08-23
+## 0.4.0 / 2016-08-23
 
 * [FEATURE] Silences are now paginated in the web ui
 * [CHANGE] Failure to start on unparsed flags

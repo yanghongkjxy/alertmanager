@@ -1,17 +1,27 @@
 module Alerts.Api exposing (..)
 
-import Alerts.Types exposing (Alert, RouteOpts, Block, AlertGroup)
+import Alerts.Types exposing (Alert, Receiver)
 import Json.Decode as Json exposing (..)
-import Utils.Api exposing (baseUrl, iso8601Time)
-import Utils.Types exposing (ApiData)
+import Utils.Api exposing (iso8601Time)
 import Utils.Filter exposing (Filter, generateQueryString)
+import Utils.Types exposing (ApiData)
+import Regex
 
 
-fetchAlerts : Filter -> Cmd (ApiData (List Alert))
-fetchAlerts filter =
+fetchReceivers : String -> Cmd (ApiData (List Receiver))
+fetchReceivers apiUrl =
+    Utils.Api.send
+        (Utils.Api.get
+            (apiUrl ++ "/receivers")
+            (field "data" (list (Json.map (\receiver -> Receiver receiver (Regex.escape receiver)) string)))
+        )
+
+
+fetchAlerts : String -> Filter -> Cmd (ApiData (List Alert))
+fetchAlerts apiUrl filter =
     let
         url =
-            String.join "/" [ baseUrl, "alerts" ++ (generateQueryString filter) ]
+            String.join "/" [ apiUrl, "alerts" ++ generateQueryString filter ]
     in
         Utils.Api.send (Utils.Api.get url alertsDecoder)
 
@@ -28,11 +38,14 @@ alertsDecoder =
 -}
 alertDecoder : Json.Decoder (String -> Alert)
 alertDecoder =
-    Json.map5 Alert
+    Json.map6 Alert
         (Json.maybe (field "annotations" (Json.keyValuePairs Json.string))
             |> andThen (Maybe.withDefault [] >> Json.succeed)
         )
         (field "labels" (Json.keyValuePairs Json.string))
         (Json.maybe (Json.at [ "status", "silencedBy", "0" ] Json.string))
+        (Json.maybe (Json.at [ "status", "inhibitedBy", "0" ] Json.string)
+            |> Json.map ((/=) Nothing)
+        )
         (field "startsAt" iso8601Time)
         (field "generatorURL" Json.string)

@@ -1,15 +1,15 @@
-module Views.AlertList.AlertView exposing (view)
+module Views.AlertList.AlertView exposing (view, addLabelMsg)
 
 import Alerts.Types exposing (Alert)
 import Html exposing (..)
-import Html.Attributes exposing (class, style, href)
+import Html.Attributes exposing (class, style, href, value, readonly, title)
 import Html.Events exposing (onClick)
 import Types exposing (Msg(CreateSilenceFromAlert, Noop, MsgForAlertList))
 import Utils.Date
 import Views.FilterBar.Types as FilterBarTypes
 import Views.AlertList.Types exposing (AlertListMsg(MsgForFilterBar, SetActive))
 import Utils.Filter
-import Time exposing (Time)
+import Utils.Views
 
 
 view : List ( String, String ) -> Maybe String -> Alert -> Html Msg
@@ -27,7 +27,7 @@ view labels maybeActiveId alert =
             ]
             [ div
                 [ class "w-100 mb-2 d-flex align-items-start" ]
-                [ dateView alert.startsAt
+                [ titleView alert
                 , if List.length alert.annotations > 0 then
                     annotationsButton maybeActiveId alert
                   else
@@ -43,13 +43,24 @@ view labels maybeActiveId alert =
             ]
 
 
-dateView : Time -> Html Msg
-dateView time =
-    span
-        [ class "text-muted align-self-center mr-2"
-        ]
-        [ text (Utils.Date.timeFormat time ++ ", " ++ Utils.Date.dateFormat time)
-        ]
+titleView : Alert -> Html Msg
+titleView { startsAt, isInhibited } =
+    let
+        ( className, inhibited ) =
+            if isInhibited then
+                ( "text-muted", " (inhibited)" )
+            else
+                ( "", "" )
+    in
+        span
+            [ class ("align-self-center mr-2 " ++ className) ]
+            [ text
+                (Utils.Date.timeFormat startsAt
+                    ++ ", "
+                    ++ Utils.Date.dateFormat startsAt
+                    ++ inhibited
+                )
+            ]
 
 
 annotationsButton : Maybe String -> Alert -> Html Msg
@@ -72,29 +83,44 @@ annotation : ( String, String ) -> Html Msg
 annotation ( key, value ) =
     tr []
         [ th [ class "text-nowrap" ] [ text (key ++ ":") ]
-        , td [ class "w-100" ] [ text value ]
+        , td [ class "w-100" ] (Utils.Views.linkifyText value)
         ]
 
 
 labelButton : ( String, String ) -> Html Msg
-labelButton ( key, value ) =
-    button
-        [ class "btn btn-sm bg-faded btn-secondary mr-2 mb-2"
-        , onClick (addLabelMsg ( key, value ))
+labelButton ( key, val ) =
+    div
+        [ class "btn-group mr-2 mb-2" ]
+        [ span
+            [ class "btn btn-sm border-right-0 text-muted"
+
+            -- have to reset bootstrap button styles to make the text selectable
+            , style
+                [ ( "user-select", "initial" )
+                , ( "-moz-user-select", "initial" )
+                , ( "-webkit-user-select", "initial" )
+                , ( "border-color", "#ccc" )
+                ]
+            ]
+            [ text (key ++ "=\"" ++ val ++ "\"") ]
+        , button
+            [ class "btn btn-sm bg-faded btn-outline-secondary"
+            , onClick (addLabelMsg ( key, val ))
+            , title "Filter by this label"
+            ]
+            [ text "+" ]
         ]
-        [ span [ class "text-muted" ] [ text (key ++ "=\"" ++ value ++ "\"") ] ]
 
 
 addLabelMsg : ( String, String ) -> Msg
 addLabelMsg ( key, value ) =
-    (FilterBarTypes.AddFilterMatcher False
+    FilterBarTypes.AddFilterMatcher False
         { key = key
         , op = Utils.Filter.Eq
         , value = value
         }
         |> MsgForFilterBar
         |> MsgForAlertList
-    )
 
 
 silenceButton : Alert -> Html Msg
