@@ -1,9 +1,10 @@
-module Views.SilenceForm.Updates exposing (update)
+port module Views.SilenceForm.Updates exposing (update)
 
 import Alerts.Api
 import Silences.Api
 import Task
 import Time
+import Types exposing (Msg(MsgForSilenceForm, SetDefaultCreator))
 import Navigation
 import Utils.Date exposing (timeFromString)
 import Utils.List
@@ -18,6 +19,7 @@ import Views.SilenceForm.Types
         , SilenceFormFieldMsg(..)
         , fromMatchersAndTime
         , fromSilence
+        , parseEndsAt
         , validateForm
         , toSilence
         , emptyMatcher
@@ -41,7 +43,12 @@ updateForm msg form =
                 durationValue =
                     case Result.map2 (-) endsAt startsAt of
                         Ok duration ->
-                            Utils.Date.durationFormat duration
+                            case Utils.Date.durationFormat duration of
+                                Just value ->
+                                    value
+
+                                Nothing ->
+                                    form.duration.value
 
                         Err _ ->
                             form.duration.value
@@ -50,11 +57,6 @@ updateForm msg form =
                     | startsAt = updateValue time form.startsAt
                     , duration = updateValue durationValue form.duration
                 }
-
-        ValidateStartsAt ->
-            { form
-                | startsAt = validate Utils.Date.timeFromString form.startsAt
-            }
 
         UpdateEndsAt time ->
             let
@@ -67,7 +69,12 @@ updateForm msg form =
                 durationValue =
                     case Result.map2 (-) endsAt startsAt of
                         Ok duration ->
-                            Utils.Date.durationFormat duration
+                            case Utils.Date.durationFormat duration of
+                                Just value ->
+                                    value
+
+                                Nothing ->
+                                    form.duration.value
 
                         Err _ ->
                             form.duration.value
@@ -76,11 +83,6 @@ updateForm msg form =
                     | endsAt = updateValue time form.endsAt
                     , duration = updateValue durationValue form.duration
                 }
-
-        ValidateEndsAt ->
-            { form
-                | endsAt = validate Utils.Date.timeFromString form.endsAt
-            }
 
         UpdateDuration time ->
             let
@@ -103,9 +105,11 @@ updateForm msg form =
                     , duration = updateValue time form.duration
                 }
 
-        ValidateDuration ->
+        ValidateTime ->
             { form
-                | duration = validate Utils.Date.parseDuration form.duration
+                | startsAt = validate Utils.Date.timeFromString form.startsAt
+                , endsAt = validate (parseEndsAt form.startsAt.value) form.endsAt
+                , duration = validate Utils.Date.parseDuration form.duration
             }
 
         UpdateCreatedBy createdBy ->
@@ -154,7 +158,7 @@ updateForm msg form =
             let
                 matchers =
                     Utils.List.replaceIndex index
-                        (\matcher -> { matcher | value = validate stringNotEmpty matcher.value })
+                        (\matcher -> { matcher | value = matcher.value })
                         form.matchers
             in
                 { form | matchers = matchers }
@@ -169,14 +173,18 @@ updateForm msg form =
                 { form | matchers = matchers }
 
 
-update : SilenceFormMsg -> Model -> String -> String -> ( Model, Cmd SilenceFormMsg )
+update : SilenceFormMsg -> Model -> String -> String -> ( Model, Cmd Msg )
 update msg model basePath apiUrl =
     case msg of
         CreateSilence ->
             case toSilence model.form of
                 Just silence ->
                     ( { model | silenceId = Loading }
-                    , Silences.Api.create apiUrl silence |> Cmd.map SilenceCreate
+                    , Cmd.batch
+                        [ Silences.Api.create apiUrl silence |> Cmd.map (SilenceCreate >> MsgForSilenceForm)
+                        , persistDefaultCreator silence.createdBy
+                        , Task.succeed silence.createdBy |> Task.perform SetDefaultCreator
+                        ]
                     )
 
                 Nothing ->
@@ -199,11 +207,11 @@ update msg model basePath apiUrl =
             in
                 ( { model | silenceId = silenceId }, cmd )
 
-        NewSilenceFromMatchers matchers ->
-            ( model, Task.perform (NewSilenceFromMatchersAndTime matchers) Time.now )
+        NewSilenceFromMatchers defaultCreator matchers ->
+            ( model, Task.perform (NewSilenceFromMatchersAndTime defaultCreator matchers >> MsgForSilenceForm) Time.now )
 
-        NewSilenceFromMatchersAndTime matchers time ->
-            ( { form = fromMatchersAndTime matchers time
+        NewSilenceFromMatchersAndTime defaultCreator matchers time ->
+            ( { form = fromMatchersAndTime defaultCreator matchers time
               , alerts = Initial
               , silenceId = Initial
               }
@@ -211,11 +219,11 @@ update msg model basePath apiUrl =
             )
 
         FetchSilence silenceId ->
-            ( model, Silences.Api.getSilence apiUrl silenceId SilenceFetch )
+            ( model, Silences.Api.getSilence apiUrl silenceId (SilenceFetch >> MsgForSilenceForm) )
 
         SilenceFetch (Success silence) ->
             ( { model | form = fromSilence silence }
-            , Task.perform identity (Task.succeed PreviewSilence)
+            , Task.perform identity (Task.succeed (MsgForSilenceForm PreviewSilence))
             )
 
         SilenceFetch _ ->
@@ -228,7 +236,7 @@ update msg model basePath apiUrl =
                     , Alerts.Api.fetchAlerts
                         apiUrl
                         { nullFilter | text = Just (Utils.List.mjoin silence.matchers) }
-                        |> Cmd.map AlertGroupsPreview
+                        |> Cmd.map (AlertGroupsPreview >> MsgForSilenceForm)
                     )
 
                 Nothing ->
@@ -251,3 +259,6 @@ update msg model basePath apiUrl =
               }
             , Cmd.none
             )
+
+
+port persistDefaultCreator : String -> Cmd msg

@@ -1,37 +1,41 @@
 package cli
 
 import (
-	"bytes"
-	"encoding/json"
+	"context"
 	"errors"
 	"fmt"
-	"net/http"
 	"os/user"
-	"path"
 	"time"
 
+	"github.com/prometheus/client_golang/api"
+	"github.com/prometheus/common/model"
+	"gopkg.in/alecthomas/kingpin.v2"
+
+	"github.com/prometheus/alertmanager/client"
 	"github.com/prometheus/alertmanager/types"
-	"github.com/spf13/cobra"
-	flag "github.com/spf13/pflag"
-	"github.com/spf13/viper"
 )
 
-type addResponse struct {
-	Status string `json:"status"`
-	Data   struct {
-		SilenceID string `json:"silenceId"`
-	} `json:"data,omitempty"`
-	ErrorType string `json:"errorType,omitempty"`
-	Error     string `json:"error,omitempty"`
+func username() string {
+	user, err := user.Current()
+	if err != nil {
+		return ""
+	}
+	return user.Username
 }
 
-var addFlags *flag.FlagSet
-var addCmd = &cobra.Command{
-	Use:   "add",
-	Short: "Add silence",
-	Long: `Add a new alertmanager silence
+type silenceAddCmd struct {
+	author         string
+	requireComment bool
+	duration       string
+	start          string
+	end            string
+	comment        string
+	matchers       []string
+}
 
-  Amtool uses a simplified prometheus syntax to represent silences. The
+const silenceAddHelp = `Add a new alertmanager silence
+
+  Amtool uses a simplified Prometheus syntax to represent silences. The
   non-option section of arguments constructs a list of "Matcher Groups"
   that will be used to create a number of silences. The following examples
   will attempt to show this behaviour in action:
@@ -43,78 +47,78 @@ var addCmd = &cobra.Command{
 
   amtool silence add foo node=bar
 
-	If alertname is ommited and the first argument does not contain a '=' or a
+	If alertname is omitted and the first argument does not contain a '=' or a
 	'=~' then it will be assumed to be the value of the alertname pair.
 
   amtool silence add 'alertname=~foo.*'
 
 	As well as direct equality, regex matching is also supported. The '=~' syntax
-	(similar to prometheus) is used to represent a regex match. Regex matching
+	(similar to Prometheus) is used to represent a regex match. Regex matching
 	can be used in combination with a direct match.
-	`,
-	Run: CommandWrapper(add),
+`
+
+func configureSilenceAddCmd(cc *kingpin.CmdClause) {
+	var (
+		c      = &silenceAddCmd{}
+		addCmd = cc.Command("add", silenceAddHelp)
+	)
+	addCmd.Flag("author", "Username for CreatedBy field").Short('a').Default(username()).StringVar(&c.author)
+	addCmd.Flag("require-comment", "Require comment to be set").Hidden().Default("true").BoolVar(&c.requireComment)
+	addCmd.Flag("duration", "Duration of silence").Short('d').Default("1h").StringVar(&c.duration)
+	addCmd.Flag("start", "Set when the silence should start. RFC3339 format 2006-01-02T15:04:05Z07:00").StringVar(&c.start)
+	addCmd.Flag("end", "Set when the silence should end (overwrites duration). RFC3339 format 2006-01-02T15:04:05Z07:00").StringVar(&c.end)
+	addCmd.Flag("comment", "A comment to help describe the silence").Short('c').StringVar(&c.comment)
+	addCmd.Arg("matcher-groups", "Query filter").StringsVar(&c.matchers)
+	addCmd.Action(c.add)
+
 }
 
-func init() {
-	var username string
-
-	user, err := user.Current()
-	if err != nil {
-		fmt.Printf("failed to get the current user, specify one with --author: %v\n", err)
-	} else {
-		username = user.Username
-	}
-
-	addCmd.Flags().StringP("author", "a", username, "Username for CreatedBy field")
-	addCmd.Flags().StringP("expires", "e", "1h", "Duration of silence (100h)")
-	addCmd.Flags().String("expire-on", "", "Expire at a certain time (Overwrites expires) RFC3339 format 2006-01-02T15:04:05Z07:00")
-	addCmd.Flags().StringP("comment", "c", "", "A comment to help describe the silence")
-	viper.BindPFlag("author", addCmd.Flags().Lookup("author"))
-	viper.BindPFlag("expires", addCmd.Flags().Lookup("expires"))
-	viper.BindPFlag("comment", addCmd.Flags().Lookup("comment"))
-	viper.SetDefault("comment_required", false)
-	addFlags = addCmd.Flags()
-}
-
-func add(cmd *cobra.Command, args []string) error {
+func (c *silenceAddCmd) add(ctx *kingpin.ParseContext) error {
 	var err error
 
-	matchers, err := parseMatchers(args)
+	matchers, err := parseMatchers(c.matchers)
 	if err != nil {
 		return err
 	}
 
 	if len(matchers) < 1 {
-		return fmt.Errorf("No matchers specified")
+		return fmt.Errorf("no matchers specified")
 	}
 
-	expire_on, err := addFlags.GetString("expire-on")
-	if err != nil {
-		return err
-	}
-
-	expires := viper.GetString("expires")
 	var endsAt time.Time
-
-	if expire_on != "" {
-		endsAt, err = time.Parse(time.RFC3339, expire_on)
+	if c.end != "" {
+		endsAt, err = time.Parse(time.RFC3339, c.end)
 		if err != nil {
 			return err
 		}
 	} else {
-		duration, err := time.ParseDuration(expires)
+		d, err := model.ParseDuration(c.duration)
 		if err != nil {
 			return err
 		}
-		endsAt = time.Now().UTC().Add(duration)
+		if d == 0 {
+			return fmt.Errorf("silence duration must be greater than 0")
+		}
+		endsAt = time.Now().UTC().Add(time.Duration(d))
 	}
 
-	author := viper.GetString("author")
-	comment := viper.GetString("comment")
-	comment_required := viper.GetBool("comment_required")
+	if c.requireComment && c.comment == "" {
+		return errors.New("comment required by config")
+	}
 
-	if comment_required && comment == "" {
-		return errors.New("Comment required by config")
+	var startsAt time.Time
+	if c.start != "" {
+		startsAt, err = time.Parse(time.RFC3339, c.start)
+		if err != nil {
+			return err
+		}
+
+	} else {
+		startsAt = time.Now().UTC()
+	}
+
+	if startsAt.After(endsAt) {
+		return errors.New("silence cannot start after it ends")
 	}
 
 	typeMatchers, err := TypeMatchers(matchers)
@@ -124,40 +128,22 @@ func add(cmd *cobra.Command, args []string) error {
 
 	silence := types.Silence{
 		Matchers:  typeMatchers,
-		StartsAt:  time.Now().UTC(),
+		StartsAt:  startsAt,
 		EndsAt:    endsAt,
-		CreatedBy: author,
-		Comment:   comment,
+		CreatedBy: c.author,
+		Comment:   c.comment,
 	}
 
-	u, err := GetAlertmanagerURL()
+	apiClient, err := api.NewClient(api.Config{Address: alertmanagerURL.String()})
 	if err != nil {
 		return err
 	}
-	u.Path = path.Join(u.Path, "/api/v1/silences")
-
-	buf := bytes.NewBuffer([]byte{})
-	err = json.NewEncoder(buf).Encode(silence)
-	if err != nil {
-		return err
-	}
-
-	res, err := http.Post(u.String(), "application/json", buf)
+	silenceAPI := client.NewSilenceAPI(apiClient)
+	silenceID, err := silenceAPI.Set(context.Background(), silence)
 	if err != nil {
 		return err
 	}
 
-	defer res.Body.Close()
-	response := addResponse{}
-	err = json.NewDecoder(res.Body).Decode(&response)
-	if err != nil {
-		return errors.New(fmt.Sprintf("Unable to parse silence json response from %s", u.String()))
-	}
-
-	if response.Status == "error" {
-		fmt.Printf("[%s] %s\n", response.ErrorType, response.Error)
-	} else {
-		fmt.Println(response.Data.SilenceID)
-	}
-	return nil
+	_, err = fmt.Println(silenceID)
+	return err
 }

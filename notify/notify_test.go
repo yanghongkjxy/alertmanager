@@ -21,8 +21,6 @@ import (
 	"time"
 
 	"github.com/go-kit/kit/log"
-	"github.com/golang/protobuf/ptypes"
-	"github.com/golang/protobuf/ptypes/timestamp"
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/net/context"
@@ -75,14 +73,6 @@ func (l *testNflog) Snapshot(w io.Writer) (int, error) {
 	return 0, nil
 }
 
-func mustTimestampProto(ts time.Time) *timestamp.Timestamp {
-	tspb, err := ptypes.TimestampProto(ts)
-	if err != nil {
-		panic(err)
-	}
-	return tspb
-}
-
 func alertHashSet(hashes ...uint64) map[uint64]struct{} {
 	res := map[uint64]struct{}{}
 
@@ -97,9 +87,10 @@ func TestDedupStageNeedsUpdate(t *testing.T) {
 	now := utcNow()
 
 	cases := []struct {
-		entry        *nflogpb.Entry
-		firingAlerts map[uint64]struct{}
-		repeat       time.Duration
+		entry          *nflogpb.Entry
+		firingAlerts   map[uint64]struct{}
+		resolvedAlerts map[uint64]struct{}
+		repeat         time.Duration
 
 		res    bool
 		resErr bool
@@ -135,6 +126,44 @@ func TestDedupStageNeedsUpdate(t *testing.T) {
 			repeat:       10 * time.Minute,
 			firingAlerts: alertHashSet(1, 2, 3),
 			res:          true,
+		}, {
+			entry: &nflogpb.Entry{
+				ResolvedAlerts: []uint64{1, 2, 3},
+				Timestamp:      now.Add(-11 * time.Minute),
+			},
+			repeat:         10 * time.Minute,
+			resolvedAlerts: alertHashSet(3, 4, 5),
+			res:            false,
+		}, {
+			entry: &nflogpb.Entry{
+				FiringAlerts:   []uint64{1, 2},
+				ResolvedAlerts: []uint64{3},
+				Timestamp:      now.Add(-11 * time.Minute),
+			},
+			repeat:         10 * time.Minute,
+			firingAlerts:   alertHashSet(1),
+			resolvedAlerts: alertHashSet(2, 3),
+			res:            true,
+		}, {
+			entry: &nflogpb.Entry{
+				FiringAlerts:   []uint64{1, 2},
+				ResolvedAlerts: []uint64{3},
+				Timestamp:      now.Add(-9 * time.Minute),
+			},
+			repeat:         10 * time.Minute,
+			firingAlerts:   alertHashSet(1),
+			resolvedAlerts: alertHashSet(2, 3),
+			res:            false,
+		}, {
+			entry: &nflogpb.Entry{
+				FiringAlerts:   []uint64{1, 2},
+				ResolvedAlerts: []uint64{3},
+				Timestamp:      now.Add(-9 * time.Minute),
+			},
+			repeat:         10 * time.Minute,
+			firingAlerts:   alertHashSet(),
+			resolvedAlerts: alertHashSet(1, 2, 3),
+			res:            true,
 		},
 	}
 	for i, c := range cases {
@@ -143,7 +172,7 @@ func TestDedupStageNeedsUpdate(t *testing.T) {
 		s := &DedupStage{
 			now: func() time.Time { return now },
 		}
-		ok, err := s.needsUpdate(c.entry, c.firingAlerts, nil, c.repeat)
+		ok, err := s.needsUpdate(c.entry, c.firingAlerts, c.resolvedAlerts, c.repeat)
 		if c.resErr {
 			require.Error(t, err)
 		} else {
@@ -185,14 +214,14 @@ func TestDedupStage(t *testing.T) {
 	s.nflog = &testNflog{
 		qerr: errors.New("bad things"),
 	}
-	ctx, res, err := s.Exec(ctx, log.NewNopLogger(), alerts...)
+	ctx, _, err = s.Exec(ctx, log.NewNopLogger(), alerts...)
 	require.EqualError(t, err, "bad things")
 
 	// ... but skip ErrNotFound.
 	s.nflog = &testNflog{
 		qerr: nflog.ErrNotFound,
 	}
-	ctx, res, err = s.Exec(ctx, log.NewNopLogger(), alerts...)
+	ctx, res, err := s.Exec(ctx, log.NewNopLogger(), alerts...)
 	require.NoError(t, err, "unexpected error on not found log entry")
 	require.Equal(t, alerts, res, "input alerts differ from result alerts")
 
@@ -203,7 +232,7 @@ func TestDedupStage(t *testing.T) {
 			{FiringAlerts: []uint64{1, 2, 3}},
 		},
 	}
-	ctx, res, err = s.Exec(ctx, log.NewNopLogger(), alerts...)
+	ctx, _, err = s.Exec(ctx, log.NewNopLogger(), alerts...)
 	require.Contains(t, err.Error(), "result size")
 
 	// Must return no error and no alerts no need to update.
@@ -232,7 +261,7 @@ func TestDedupStage(t *testing.T) {
 			},
 		},
 	}
-	ctx, res, err = s.Exec(ctx, log.NewNopLogger(), alerts...)
+	_, res, err = s.Exec(ctx, log.NewNopLogger(), alerts...)
 	require.NoError(t, err)
 	require.Equal(t, alerts, res, "unexpected alerts returned")
 }
@@ -494,8 +523,7 @@ func TestInhibitStage(t *testing.T) {
 		return ok
 	})
 
-	marker := types.NewMarker()
-	inhibitor := NewInhibitStage(muter, marker)
+	inhibitor := NewInhibitStage(muter)
 
 	in := []model.LabelSet{
 		{},
@@ -520,10 +548,6 @@ func TestInhibitStage(t *testing.T) {
 			Alert: model.Alert{Labels: lset},
 		})
 	}
-
-	// Set the second alert as previously inhibited. It is expected to have
-	// the WasInhibited flag set to true afterwards.
-	marker.SetInhibited(inAlerts[1].Fingerprint(), "123")
 
 	_, alerts, err := inhibitor.Exec(nil, log.NewNopLogger(), inAlerts...)
 	if err != nil {

@@ -62,6 +62,11 @@ init flags location =
                 |> Json.decodeValue (Json.field "production" Json.bool)
                 |> Result.withDefault False
 
+        defaultCreator =
+            flags
+                |> Json.decodeValue (Json.field "defaultCreator" Json.string)
+                |> Result.withDefault ""
+
         apiUrl =
             if prod then
                 Api.makeApiUrl location.pathname
@@ -72,7 +77,7 @@ init flags location =
             if prod then
                 location.pathname
             else
-                "http://localhost:9093/"
+                "/"
     in
         update (urlUpdate location)
             (Model
@@ -88,6 +93,7 @@ init flags location =
                 libUrl
                 Loading
                 Loading
+                defaultCreator
             )
 
 
@@ -107,8 +113,8 @@ urlUpdate location =
             SilenceFormEditRoute silenceId ->
                 NavigateToSilenceFormEdit silenceId
 
-            SilenceFormNewRoute keep ->
-                NavigateToSilenceFormNew keep
+            SilenceFormNewRoute matchers ->
+                NavigateToSilenceFormNew matchers
 
             AlertsRoute filter ->
                 NavigateToAlerts filter

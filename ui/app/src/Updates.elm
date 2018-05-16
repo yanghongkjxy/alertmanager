@@ -9,7 +9,6 @@ import Types
         , Msg(..)
         , Route(AlertsRoute, NotFoundRoute, SilenceFormEditRoute, SilenceFormNewRoute, SilenceListRoute, SilenceViewRoute, StatusRoute)
         )
-import Utils.Types exposing (ApiData(Failure, Loading, Success), Matcher)
 import Views.AlertList.Types exposing (AlertListMsg(FetchAlerts))
 import Views.AlertList.Updates
 import Views.SilenceForm.Types exposing (SilenceFormMsg(FetchSilence, NewSilenceFromMatchers))
@@ -25,16 +24,6 @@ import Views.Status.Updates
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg ({ basePath, apiUrl } as model) =
     case msg of
-        CreateSilenceFromAlert { labels } ->
-            let
-                matchers =
-                    List.map (\( k, v ) -> Matcher False k v) labels
-
-                ( silenceForm, cmd ) =
-                    Views.SilenceForm.Updates.update (NewSilenceFromMatchers matchers) model.silenceForm basePath apiUrl
-            in
-                ( { model | silenceForm = silenceForm }, Cmd.map MsgForSilenceForm cmd )
-
         NavigateToAlerts filter ->
             let
                 ( alertList, cmd ) =
@@ -63,12 +52,9 @@ update msg ({ basePath, apiUrl } as model) =
                 , Cmd.map MsgForSilenceView cmd
                 )
 
-        NavigateToSilenceFormNew keep ->
-            ( { model | route = SilenceFormNewRoute keep }
-            , if keep then
-                Cmd.none
-              else
-                Task.perform (NewSilenceFromMatchers >> MsgForSilenceForm) (Task.succeed [])
+        NavigateToSilenceFormNew matchers ->
+            ( { model | route = SilenceFormNewRoute matchers }
+            , Task.perform (NewSilenceFromMatchers model.defaultCreator >> MsgForSilenceForm) (Task.succeed matchers)
             )
 
         NavigateToSilenceFormEdit uuid ->
@@ -125,10 +111,13 @@ update msg ({ basePath, apiUrl } as model) =
                 ( silenceForm, cmd ) =
                     Views.SilenceForm.Updates.update msg model.silenceForm basePath apiUrl
             in
-                ( { model | silenceForm = silenceForm }, Cmd.map MsgForSilenceForm cmd )
+                ( { model | silenceForm = silenceForm }, cmd )
 
         BootstrapCSSLoaded css ->
             ( { model | bootstrapCSS = css }, Cmd.none )
 
         FontAwesomeCSSLoaded css ->
             ( { model | fontAwesomeCSS = css }, Cmd.none )
+
+        SetDefaultCreator name ->
+            ( { model | defaultCreator = name }, Cmd.none )

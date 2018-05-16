@@ -15,6 +15,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -30,6 +31,7 @@ import (
 	"github.com/prometheus/common/version"
 	"github.com/prometheus/prometheus/pkg/labels"
 
+	"github.com/prometheus/alertmanager/cluster"
 	"github.com/prometheus/alertmanager/config"
 	"github.com/prometheus/alertmanager/dispatch"
 	"github.com/prometheus/alertmanager/pkg/parse"
@@ -37,7 +39,6 @@ import (
 	"github.com/prometheus/alertmanager/silence"
 	"github.com/prometheus/alertmanager/silence/silencepb"
 	"github.com/prometheus/alertmanager/types"
-	"github.com/weaveworks/mesh"
 )
 
 var (
@@ -55,6 +56,9 @@ var (
 )
 
 func init() {
+	numReceivedAlerts.WithLabelValues("firing")
+	numReceivedAlerts.WithLabelValues("resolved")
+
 	prometheus.Register(numReceivedAlerts)
 	prometheus.Register(numInvalidAlerts)
 }
@@ -81,7 +85,7 @@ type API struct {
 	route          *dispatch.Route
 	resolveTimeout time.Duration
 	uptime         time.Time
-	mrouter        *mesh.Router
+	peer           *cluster.Peer
 	logger         log.Logger
 
 	groups         groupsFn
@@ -94,14 +98,25 @@ type groupsFn func([]*labels.Matcher) dispatch.AlertOverview
 type getAlertStatusFn func(model.Fingerprint) types.AlertStatus
 
 // New returns a new API.
-func New(alerts provider.Alerts, silences *silence.Silences, gf groupsFn, sf getAlertStatusFn, router *mesh.Router, l log.Logger) *API {
+func New(
+	alerts provider.Alerts,
+	silences *silence.Silences,
+	gf groupsFn,
+	sf getAlertStatusFn,
+	peer *cluster.Peer,
+	l log.Logger,
+) *API {
+	if l == nil {
+		l = log.NewNopLogger()
+	}
+
 	return &API{
 		alerts:         alerts,
 		silences:       silences,
 		groups:         gf,
 		getAlertStatus: sf,
 		uptime:         time.Now(),
-		mrouter:        router,
+		peer:           peer,
 		logger:         l,
 	}
 }
@@ -109,32 +124,26 @@ func New(alerts provider.Alerts, silences *silence.Silences, gf groupsFn, sf get
 // Register registers the API handlers under their correct routes
 // in the given router.
 func (api *API) Register(r *route.Router) {
-	ihf := func(name string, f http.HandlerFunc) http.HandlerFunc {
-		return prometheus.InstrumentHandlerFunc(name, func(w http.ResponseWriter, r *http.Request) {
+	wrap := func(f http.HandlerFunc) http.HandlerFunc {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			setCORS(w)
 			f(w, r)
 		})
 	}
 
-	r.Options("/*path", ihf("options", func(w http.ResponseWriter, r *http.Request) {}))
+	r.Options("/*path", wrap(func(w http.ResponseWriter, r *http.Request) {}))
 
-	// Register legacy forwarder for alert pushing.
-	r.Post("/alerts", ihf("legacy_add_alerts", api.legacyAddAlerts))
+	r.Get("/status", wrap(api.status))
+	r.Get("/receivers", wrap(api.receivers))
 
-	// Register actual API.
-	r = r.WithPrefix("/v1")
+	r.Get("/alerts/groups", wrap(api.alertGroups))
+	r.Get("/alerts", wrap(api.listAlerts))
+	r.Post("/alerts", wrap(api.addAlerts))
 
-	r.Get("/status", ihf("status", api.status))
-	r.Get("/receivers", ihf("receivers", api.receivers))
-	r.Get("/alerts/groups", ihf("alert_groups", api.alertGroups))
-
-	r.Get("/alerts", ihf("list_alerts", api.listAlerts))
-	r.Post("/alerts", ihf("add_alerts", api.addAlerts))
-
-	r.Get("/silences", ihf("list_silences", api.listSilences))
-	r.Post("/silences", ihf("add_silence", api.setSilence))
-	r.Get("/silence/:sid", ihf("get_silence", api.getSilence))
-	r.Del("/silence/:sid", ihf("del_silence", api.delSilence))
+	r.Get("/silences", wrap(api.listSilences))
+	r.Post("/silences", wrap(api.setSilence))
+	r.Get("/silence/:sid", wrap(api.getSilence))
+	r.Del("/silence/:sid", wrap(api.delSilence))
 }
 
 // Update sets the configuration string to a new value.
@@ -152,8 +161,8 @@ type errorType string
 
 const (
 	errorNone     errorType = ""
-	errorInternal           = "server_error"
-	errorBadData            = "bad_data"
+	errorInternal errorType = "server_error"
+	errorBadData  errorType = "bad_data"
 )
 
 type apiError struct {
@@ -181,11 +190,11 @@ func (api *API) status(w http.ResponseWriter, req *http.Request) {
 	api.mtx.RLock()
 
 	var status = struct {
-		ConfigYAML  string            `json:"configYAML"`
-		ConfigJSON  *config.Config    `json:"configJSON"`
-		VersionInfo map[string]string `json:"versionInfo"`
-		Uptime      time.Time         `json:"uptime"`
-		MeshStatus  *meshStatus       `json:"meshStatus"`
+		ConfigYAML    string            `json:"configYAML"`
+		ConfigJSON    *config.Config    `json:"configJSON"`
+		VersionInfo   map[string]string `json:"versionInfo"`
+		Uptime        time.Time         `json:"uptime"`
+		ClusterStatus *clusterStatus    `json:"clusterStatus"`
 	}{
 		ConfigYAML: api.config.String(),
 		ConfigJSON: api.config,
@@ -197,8 +206,8 @@ func (api *API) status(w http.ResponseWriter, req *http.Request) {
 			"buildDate": version.BuildDate,
 			"goVersion": version.GoVersion,
 		},
-		Uptime:     api.uptime,
-		MeshStatus: getMeshStatus(api),
+		Uptime:        api.uptime,
+		ClusterStatus: getClusterStatus(api.peer),
 	}
 
 	api.mtx.RUnlock()
@@ -206,39 +215,30 @@ func (api *API) status(w http.ResponseWriter, req *http.Request) {
 	api.respond(w, status)
 }
 
-type meshStatus struct {
-	Name     string       `json:"name"`
-	NickName string       `json:"nickName"`
-	Peers    []peerStatus `json:"peers"`
-}
-
 type peerStatus struct {
-	Name     string `json:"name"`     // e.g. "00:00:00:00:00:01"
-	NickName string `json:"nickName"` // e.g. "a"
-	UID      uint64 `json:"uid"`      // e.g. "14015114173033265000"
+	Name    string `json:"name"`
+	Address string `json:"address"`
 }
 
-func getMeshStatus(api *API) *meshStatus {
-	if api.mrouter == nil {
+type clusterStatus struct {
+	Name   string       `json:"name"`
+	Status string       `json:"status"`
+	Peers  []peerStatus `json:"peers"`
+}
+
+func getClusterStatus(p *cluster.Peer) *clusterStatus {
+	if p == nil {
 		return nil
 	}
+	s := &clusterStatus{Name: p.Name(), Status: p.Status()}
 
-	status := mesh.NewStatus(api.mrouter)
-	strippedStatus := &meshStatus{
-		Name:     status.Name,
-		NickName: status.NickName,
-		Peers:    make([]peerStatus, len(status.Peers)),
+	for _, n := range p.Peers() {
+		s.Peers = append(s.Peers, peerStatus{
+			Name:    n.Name,
+			Address: n.Address(),
+		})
 	}
-
-	for i := 0; i < len(status.Peers); i++ {
-		strippedStatus.Peers[i] = peerStatus{
-			Name:     status.Peers[i].Name,
-			NickName: status.Peers[i].NickName,
-			UID:      uint64(status.Peers[i].UID),
-		}
-	}
-
-	return strippedStatus
+	return s
 }
 
 func (api *API) alertGroups(w http.ResponseWriter, r *http.Request) {
@@ -263,15 +263,35 @@ func (api *API) alertGroups(w http.ResponseWriter, r *http.Request) {
 
 func (api *API) listAlerts(w http.ResponseWriter, r *http.Request) {
 	var (
-		err error
-		re  *regexp.Regexp
+		err            error
+		receiverFilter *regexp.Regexp
 		// Initialize result slice to prevent api returning `null` when there
 		// are no alerts present
-		res           = []*dispatch.APIAlert{}
-		matchers      = []*labels.Matcher{}
-		showSilenced  = true
-		showInhibited = true
+		res      = []*dispatch.APIAlert{}
+		matchers = []*labels.Matcher{}
+
+		showActive, showInhibited     bool
+		showSilenced, showUnprocessed bool
 	)
+
+	getBoolParam := func(name string) (bool, error) {
+		v := r.FormValue(name)
+		if v == "" {
+			return true, nil
+		}
+		if v == "false" {
+			return false, nil
+		}
+		if v != "true" {
+			err := fmt.Errorf("parameter %q can either be 'true' or 'false', not %q", name, v)
+			api.respondError(w, apiError{
+				typ: errorBadData,
+				err: err,
+			}, nil)
+			return false, err
+		}
+		return true, nil
+	}
 
 	if filter := r.FormValue("filter"); filter != "" {
 		matchers, err = parse.Matchers(filter)
@@ -284,38 +304,28 @@ func (api *API) listAlerts(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if silencedParam := r.FormValue("silenced"); silencedParam != "" {
-		if silencedParam == "false" {
-			showSilenced = false
-		} else if silencedParam != "true" {
-			api.respondError(w, apiError{
-				typ: errorBadData,
-				err: fmt.Errorf(
-					"parameter 'silenced' can either be 'true' or 'false', not '%v'",
-					silencedParam,
-				),
-			}, nil)
-			return
-		}
+	showActive, err = getBoolParam("active")
+	if err != nil {
+		return
 	}
 
-	if inhibitedParam := r.FormValue("inhibited"); inhibitedParam != "" {
-		if inhibitedParam == "false" {
-			showInhibited = false
-		} else if inhibitedParam != "true" {
-			api.respondError(w, apiError{
-				typ: errorBadData,
-				err: fmt.Errorf(
-					"parameter 'inhibited' can either be 'true' or 'false', not '%v'",
-					inhibitedParam,
-				),
-			}, nil)
-			return
-		}
+	showSilenced, err = getBoolParam("silenced")
+	if err != nil {
+		return
+	}
+
+	showInhibited, err = getBoolParam("inhibited")
+	if err != nil {
+		return
+	}
+
+	showUnprocessed, err = getBoolParam("unprocessed")
+	if err != nil {
+		return
 	}
 
 	if receiverParam := r.FormValue("receiver"); receiverParam != "" {
-		re, err = regexp.Compile("^(?:" + receiverParam + ")$")
+		receiverFilter, err = regexp.Compile("^(?:" + receiverParam + ")$")
 		if err != nil {
 			api.respondError(w, apiError{
 				typ: errorBadData,
@@ -331,6 +341,7 @@ func (api *API) listAlerts(w http.ResponseWriter, r *http.Request) {
 	alerts := api.alerts.GetPending()
 	defer alerts.Close()
 
+	api.mtx.RLock()
 	// TODO(fabxc): enforce a sensible timeout.
 	for a := range alerts.Next() {
 		if err = alerts.Err(); err != nil {
@@ -343,7 +354,7 @@ func (api *API) listAlerts(w http.ResponseWriter, r *http.Request) {
 			receivers = append(receivers, r.RouteOpts.Receiver)
 		}
 
-		if re != nil && !regexpAny(re, receivers) {
+		if receiverFilter != nil && !receiversMatchFilter(receivers, receiverFilter) {
 			continue
 		}
 
@@ -351,12 +362,20 @@ func (api *API) listAlerts(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// Continue if alert is resolved
+		// Continue if the alert is resolved.
 		if !a.Alert.EndsAt.IsZero() && a.Alert.EndsAt.Before(time.Now()) {
 			continue
 		}
 
 		status := api.getAlertStatus(a.Fingerprint())
+
+		if !showActive && status.State == types.AlertStateActive {
+			continue
+		}
+
+		if !showUnprocessed && status.State == types.AlertStateUnprocessed {
+			continue
+		}
 
 		if !showSilenced && len(status.SilencedBy) != 0 {
 			continue
@@ -375,6 +394,7 @@ func (api *API) listAlerts(w http.ResponseWriter, r *http.Request) {
 
 		res = append(res, apiAlert)
 	}
+	api.mtx.RUnlock()
 
 	if err != nil {
 		api.respondError(w, apiError{
@@ -389,9 +409,9 @@ func (api *API) listAlerts(w http.ResponseWriter, r *http.Request) {
 	api.respond(w, res)
 }
 
-func regexpAny(re *regexp.Regexp, ss []string) bool {
-	for _, s := range ss {
-		if re.MatchString(s) {
+func receiversMatchFilter(receivers []string, filter *regexp.Regexp) bool {
+	for _, r := range receivers {
+		if filter.MatchString(r) {
 			return true
 		}
 	}
@@ -400,47 +420,11 @@ func regexpAny(re *regexp.Regexp, ss []string) bool {
 }
 
 func alertMatchesFilterLabels(a *model.Alert, matchers []*labels.Matcher) bool {
-	for _, m := range matchers {
-		if v, prs := a.Labels[model.LabelName(m.Name)]; !prs || !m.Matches(string(v)) {
-			return false
-		}
+	sms := make(map[string]string)
+	for name, value := range a.Labels {
+		sms[string(name)] = string(value)
 	}
-
-	return true
-}
-
-func (api *API) legacyAddAlerts(w http.ResponseWriter, r *http.Request) {
-	var legacyAlerts = []struct {
-		Summary     model.LabelValue `json:"summary"`
-		Description model.LabelValue `json:"description"`
-		Runbook     model.LabelValue `json:"runbook"`
-		Labels      model.LabelSet   `json:"labels"`
-		Payload     model.LabelSet   `json:"payload"`
-	}{}
-	if err := api.receive(r, &legacyAlerts); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	var alerts []*types.Alert
-	for _, la := range legacyAlerts {
-		a := &types.Alert{
-			Alert: model.Alert{
-				Labels:      la.Labels,
-				Annotations: la.Payload,
-			},
-		}
-		if a.Annotations == nil {
-			a.Annotations = model.LabelSet{}
-		}
-		a.Annotations["summary"] = la.Summary
-		a.Annotations["description"] = la.Description
-		a.Annotations["runbook"] = la.Runbook
-
-		alerts = append(alerts, a)
-	}
-
-	api.insertAlerts(w, r, alerts...)
+	return matchFilterLabels(matchers, sms)
 }
 
 func (api *API) addAlerts(w http.ResponseWriter, r *http.Request) {
@@ -459,19 +443,28 @@ func (api *API) addAlerts(w http.ResponseWriter, r *http.Request) {
 func (api *API) insertAlerts(w http.ResponseWriter, r *http.Request, alerts ...*types.Alert) {
 	now := time.Now()
 
+	api.mtx.RLock()
+	resolveTimeout := api.resolveTimeout
+	api.mtx.RUnlock()
+
 	for _, alert := range alerts {
 		alert.UpdatedAt = now
 
 		// Ensure StartsAt is set.
 		if alert.StartsAt.IsZero() {
-			alert.StartsAt = now
+			if alert.EndsAt.IsZero() {
+				alert.StartsAt = now
+			} else {
+				alert.StartsAt = alert.EndsAt
+			}
 		}
 		// If no end time is defined, set a timeout after which an alert
 		// is marked resolved if it is not updated.
 		if alert.EndsAt.IsZero() {
 			alert.Timeout = true
-			alert.EndsAt = now.Add(api.resolveTimeout)
-
+			alert.EndsAt = now.Add(resolveTimeout)
+		}
+		if alert.EndsAt.After(time.Now()) {
 			numReceivedAlerts.WithLabelValues("firing").Inc()
 		} else {
 			numReceivedAlerts.WithLabelValues("resolved").Inc()
@@ -484,6 +477,8 @@ func (api *API) insertAlerts(w http.ResponseWriter, r *http.Request, alerts ...*
 		validationErrs = &types.MultiError{}
 	)
 	for _, a := range alerts {
+		removeEmptyLabels(a.Labels)
+
 		if err := a.Validate(); err != nil {
 			validationErrs.Add(err)
 			numInvalidAlerts.Inc()
@@ -510,6 +505,14 @@ func (api *API) insertAlerts(w http.ResponseWriter, r *http.Request, alerts ...*
 	api.respond(w, nil)
 }
 
+func removeEmptyLabels(ls model.LabelSet) {
+	for k, v := range ls {
+		if string(v) == "" {
+			delete(ls, k)
+		}
+	}
+}
+
 func (api *API) setSilence(w http.ResponseWriter, r *http.Request) {
 	var sil types.Silence
 	if err := api.receive(r, &sil); err != nil {
@@ -519,6 +522,27 @@ func (api *API) setSilence(w http.ResponseWriter, r *http.Request) {
 		}, nil)
 		return
 	}
+
+	// This is an API only validation, it cannot be done internally
+	// because the expired silence is semantically important.
+	// But one should not be able to create expired silences, that
+	// won't have any use.
+	if sil.Expired() {
+		api.respondError(w, apiError{
+			typ: errorBadData,
+			err: errors.New("start time must not be equal to end time"),
+		}, nil)
+		return
+	}
+
+	if sil.EndsAt.Before(time.Now()) {
+		api.respondError(w, apiError{
+			typ: errorBadData,
+			err: errors.New("end time can't be in the past"),
+		}, nil)
+		return
+	}
+
 	psil, err := silenceToProto(&sil)
 	if err != nil {
 		api.respondError(w, apiError{
@@ -610,21 +634,21 @@ func (api *API) listSilences(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if !matchesFilterLabels(s, matchers) {
+		if !silenceMatchesFilterLabels(s, matchers) {
 			continue
 		}
 		sils = append(sils, s)
 	}
 
-	var active, pending, expired, silences []*types.Silence
+	var active, pending, expired []*types.Silence
 
 	for _, s := range sils {
 		switch s.Status.State {
-		case "active":
+		case types.SilenceStateActive:
 			active = append(active, s)
-		case "pending":
+		case types.SilenceStatePending:
 			pending = append(pending, s)
-		case "expired":
+		case types.SilenceStateExpired:
 			expired = append(expired, s)
 		}
 	}
@@ -639,6 +663,9 @@ func (api *API) listSilences(w http.ResponseWriter, r *http.Request) {
 		return expired[i].EndsAt.After(expired[j].EndsAt)
 	})
 
+	// Initialize silences explicitly to an empty list (instead of nil)
+	// So that it does not get converted to "null" in JSON.
+	silences := []*types.Silence{}
 	silences = append(silences, active...)
 	silences = append(silences, pending...)
 	silences = append(silences, expired...)
@@ -646,14 +673,33 @@ func (api *API) listSilences(w http.ResponseWriter, r *http.Request) {
 	api.respond(w, silences)
 }
 
-func matchesFilterLabels(s *types.Silence, matchers []*labels.Matcher) bool {
-	sms := map[string]string{}
+func silenceMatchesFilterLabels(s *types.Silence, matchers []*labels.Matcher) bool {
+	sms := make(map[string]string)
 	for _, m := range s.Matchers {
 		sms[m.Name] = m.Value
 	}
+
+	return matchFilterLabels(matchers, sms)
+}
+
+func matchFilterLabels(matchers []*labels.Matcher, sms map[string]string) bool {
 	for _, m := range matchers {
-		if v, prs := sms[m.Name]; !prs || !m.Matches(v) {
-			return false
+		v, prs := sms[m.Name]
+		switch m.Type {
+		case labels.MatchNotRegexp, labels.MatchNotEqual:
+			if string(m.Value) == "" && prs {
+				continue
+			}
+			if !m.Matches(string(v)) {
+				return false
+			}
+		default:
+			if string(m.Value) == "" && !prs {
+				continue
+			}
+			if !prs || !m.Matches(string(v)) {
+				return false
+			}
 		}
 	}
 
@@ -717,7 +763,7 @@ type status string
 
 const (
 	statusSuccess status = "success"
-	statusError          = "error"
+	statusError   status = "error"
 )
 
 type response struct {
@@ -751,7 +797,7 @@ func (api *API) respondError(w http.ResponseWriter, apiErr apiError, data interf
 	case errorInternal:
 		w.WriteHeader(http.StatusInternalServerError)
 	default:
-		panic(fmt.Sprintf("unknown error type %q", apiErr))
+		panic(fmt.Sprintf("unknown error type %q", apiErr.Error()))
 	}
 
 	b, err := json.Marshal(&response{

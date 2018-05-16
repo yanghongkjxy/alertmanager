@@ -14,9 +14,9 @@
 package main
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/binary"
-	"flag"
 	"fmt"
 	"net"
 	"net/http"
@@ -24,8 +24,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"sort"
-	"strconv"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -34,6 +33,7 @@ import (
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/prometheus/alertmanager/api"
+	"github.com/prometheus/alertmanager/cluster"
 	"github.com/prometheus/alertmanager/config"
 	"github.com/prometheus/alertmanager/dispatch"
 	"github.com/prometheus/alertmanager/inhibit"
@@ -45,18 +45,15 @@ import (
 	"github.com/prometheus/alertmanager/types"
 	"github.com/prometheus/alertmanager/ui"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/promlog"
 	"github.com/prometheus/common/route"
 	"github.com/prometheus/common/version"
 	"github.com/prometheus/prometheus/pkg/labels"
-	"github.com/weaveworks/mesh"
+	"gopkg.in/alecthomas/kingpin.v2"
 )
 
 var (
-	peerPosition = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "alertmanager_peer_position",
-		Help: "Position the Alertmanager instance believes it's in. The position determines a peer's behavior in the cluster.",
-	})
 	configHash = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "alertmanager_config_hash",
 		Help: "Hash of the currently loaded alertmanager configuration.",
@@ -71,14 +68,41 @@ var (
 	})
 	alertsActive     prometheus.GaugeFunc
 	alertsSuppressed prometheus.GaugeFunc
+	requestDuration  = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "alertmanager_http_request_duration_seconds",
+			Help:    "Histogram of latencies for HTTP requests.",
+			Buckets: []float64{.05, 0.1, .25, .5, .75, 1, 2, 5, 20, 60},
+		},
+		[]string{"handler", "method"},
+	)
+	responseSize = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "alertmanager_http_response_size_bytes",
+			Help:    "Histogram of response size for HTTP requests.",
+			Buckets: prometheus.ExponentialBuckets(100, 10, 7),
+		},
+		[]string{"handler", "method"},
+	)
 )
 
 func init() {
-	prometheus.MustRegister(peerPosition)
 	prometheus.MustRegister(configSuccess)
 	prometheus.MustRegister(configSuccessTime)
 	prometheus.MustRegister(configHash)
+	prometheus.MustRegister(requestDuration)
+	prometheus.MustRegister(responseSize)
 	prometheus.MustRegister(version.NewCollector("alertmanager"))
+}
+
+func instrumentHandler(handlerName string, handler http.HandlerFunc) http.HandlerFunc {
+	return promhttp.InstrumentHandlerDuration(
+		requestDuration.MustCurryWith(prometheus.Labels{"handler": handlerName}),
+		promhttp.InstrumentHandlerResponseSize(
+			responseSize.MustCurryWith(prometheus.Labels{"handler": handlerName}),
+			handler,
+		),
+	)
 }
 
 func newAlertMetricByState(marker types.Marker, st types.AlertState) prometheus.GaugeFunc {
@@ -102,49 +126,48 @@ func newMarkerMetrics(marker types.Marker) {
 	prometheus.MustRegister(alertsSuppressed)
 }
 
+const defaultClusterAddr = "0.0.0.0:9094"
+
 func main() {
-	var (
-		showVersion = flag.Bool("version", false, "Print version information.")
-
-		configFile = flag.String("config.file", "alertmanager.yml", "Alertmanager configuration file name.")
-		dataDir    = flag.String("storage.path", "data/", "Base path for data storage.")
-		retention  = flag.Duration("data.retention", 5*24*time.Hour, "How long to keep data for.")
-
-		externalURL   = flag.String("web.external-url", "", "The URL under which Alertmanager is externally reachable (for example, if Alertmanager is served via a reverse proxy). Used for generating relative and absolute links back to Alertmanager itself. If the URL has a path portion, it will be used to prefix all HTTP endpoints served by Alertmanager. If omitted, relevant URL components will be derived automatically.")
-		routePrefix   = flag.String("web.route-prefix", "", "Prefix for the internal routes of web endpoints. Defaults to path of -web.external-url.")
-		listenAddress = flag.String("web.listen-address", ":9093", "Address to listen on for the web interface and API.")
-
-		meshListen = flag.String("mesh.listen-address", net.JoinHostPort("0.0.0.0", strconv.Itoa(mesh.Port)), "Mesh listen address. Pass an empty string to disable.")
-		hwaddr     = flag.String("mesh.peer-id", "", "Mesh peer ID (default: MAC address).")
-		nickname   = flag.String("mesh.nickname", mustHostname(), "Mesh peer nickname.")
-		password   = flag.String("mesh.password", "", "Password to join the peer network (empty password disables encryption).")
-	)
-	peers := &stringset{}
-	flag.Var(peers, "mesh.peer", "Initial peers (may be repeated)")
+	if os.Getenv("DEBUG") != "" {
+		runtime.SetBlockProfileRate(20)
+		runtime.SetMutexProfileFraction(20)
+	}
 
 	logLevel := &promlog.AllowedLevel{}
 	if err := logLevel.Set("info"); err != nil {
 		panic(err)
 	}
-	flag.Var(logLevel, "log.level", "Only log messages with the given severity or above. One of: [debug, info, warn, error]")
+	var (
+		configFile      = kingpin.Flag("config.file", "Alertmanager configuration file name.").Default("alertmanager.yml").String()
+		dataDir         = kingpin.Flag("storage.path", "Base path for data storage.").Default("data/").String()
+		retention       = kingpin.Flag("data.retention", "How long to keep data for.").Default("120h").Duration()
+		alertGCInterval = kingpin.Flag("alerts.gc-interval", "Interval between alert GC.").Default("30m").Duration()
+		logLevelString  = kingpin.Flag("log.level", "Only log messages with the given severity or above.").Default("info").Enum("debug", "info", "warn", "error")
 
-	flag.Parse()
+		externalURL   = kingpin.Flag("web.external-url", "The URL under which Alertmanager is externally reachable (for example, if Alertmanager is served via a reverse proxy). Used for generating relative and absolute links back to Alertmanager itself. If the URL has a path portion, it will be used to prefix all HTTP endpoints served by Alertmanager. If omitted, relevant URL components will be derived automatically.").String()
+		routePrefix   = kingpin.Flag("web.route-prefix", "Prefix for the internal routes of web endpoints. Defaults to path of --web.external-url.").String()
+		listenAddress = kingpin.Flag("web.listen-address", "Address to listen on for the web interface and API.").Default(":9093").String()
 
+		clusterBindAddr = kingpin.Flag("cluster.listen-address", "Listen address for cluster.").
+				Default(defaultClusterAddr).String()
+		clusterAdvertiseAddr = kingpin.Flag("cluster.advertise-address", "Explicit address to advertise in cluster.").String()
+		peers                = kingpin.Flag("cluster.peer", "Initial peers (may be repeated).").Strings()
+		peerTimeout          = kingpin.Flag("cluster.peer-timeout", "Time to wait between peers to send notifications.").Default("15s").Duration()
+		gossipInterval       = kingpin.Flag("cluster.gossip-interval", "Interval between sending gossip messages. By lowering this value (more frequent) gossip messages are propagated across the cluster more quickly at the expense of increased bandwidth.").Default(cluster.DefaultGossipInterval.String()).Duration()
+		pushPullInterval     = kingpin.Flag("cluster.pushpull-interval", "Interval for gossip state syncs. Setting this interval lower (more frequent) will increase convergence speeds across larger clusters at the expense of increased bandwidth usage.").Default(cluster.DefaultPushPullInterval.String()).Duration()
+		tcpTimeout           = kingpin.Flag("cluster.tcp-timeout", "Timeout for establishing a stream connection with a remote node for a full state sync, and for stream read and write operations.").Default(cluster.DefaultTcpTimeout.String()).Duration()
+		probeTimeout         = kingpin.Flag("cluster.probe-timeout", "Timeout to wait for an ack from a probed node before assuming it is unhealthy. This should be set to 99-percentile of RTT (round-trip time) on your network.").Default(cluster.DefaultProbeTimeout.String()).Duration()
+		probeInterval        = kingpin.Flag("cluster.probe-interval", "Interval between random node probes. Setting this lower (more frequent) will cause the cluster to detect failed nodes more quickly at the expense of increased bandwidth usage.").Default(cluster.DefaultProbeInterval.String()).Duration()
+		settleTimeout        = kingpin.Flag("cluster.settle-timeout", "Maximum time to wait for cluster connections to settle before evaluating notifications.").Default(cluster.DefaultPushPullInterval.String()).Duration()
+	)
+
+	kingpin.Version(version.Print("alertmanager"))
+	kingpin.CommandLine.GetFlag("help").Short('h')
+	kingpin.Parse()
+
+	logLevel.Set(*logLevelString)
 	logger := promlog.New(*logLevel)
-
-	if *hwaddr == "" {
-		*hwaddr = mustHardwareAddr()
-	}
-
-	if len(flag.Args()) > 0 {
-		level.Error(logger).Log("msg", "Received unexpected and unparsed arguments", "arguments", strings.Join(flag.Args(), ", "))
-		os.Exit(1)
-	}
-
-	if *showVersion {
-		fmt.Fprintln(os.Stdout, version.Print("alertmanager"))
-		os.Exit(0)
-	}
 
 	level.Info(logger).Log("msg", "Starting Alertmanager", "version", version.Info())
 	level.Info(logger).Log("build_context", version.BuildContext())
@@ -155,13 +178,29 @@ func main() {
 		os.Exit(1)
 	}
 
-	var mrouter *mesh.Router
-	if *meshListen != "" {
-		mrouter, err = initMesh(*meshListen, *hwaddr, *nickname, *password, log.With(logger, "component", "mesh"))
+	var peer *cluster.Peer
+	if *clusterBindAddr != "" {
+		peer, err = cluster.Join(log.With(logger, "component", "cluster"), prometheus.DefaultRegisterer,
+			*clusterBindAddr,
+			*clusterAdvertiseAddr,
+			*peers,
+			true,
+			*pushPullInterval,
+			*gossipInterval,
+			*tcpTimeout,
+			*probeTimeout,
+			*probeInterval,
+		)
 		if err != nil {
 			level.Error(logger).Log("msg", "Unable to initialize gossip mesh", "err", err)
 			os.Exit(1)
 		}
+		ctx, cancel := context.WithTimeout(context.Background(), *settleTimeout)
+		defer func() {
+			cancel()
+			peer.Leave(10 * time.Second)
+		}()
+		go peer.Settle(ctx, *gossipInterval*10)
 	}
 
 	stopc := make(chan struct{})
@@ -175,20 +214,15 @@ func main() {
 		nflog.WithMetrics(prometheus.DefaultRegisterer),
 		nflog.WithLogger(log.With(logger, "component", "nflog")),
 	}
-	if *meshListen != "" {
-		notificationLogOpts = append(notificationLogOpts, nflog.WithMesh(func(g mesh.Gossiper) mesh.Gossip {
-			res, err := mrouter.NewGossip("nflog", g)
-			if err != nil {
-				level.Error(logger).Log("err", err)
-				os.Exit(1)
-			}
-			return res
-		}))
-	}
+
 	notificationLog, err := nflog.New(notificationLogOpts...)
 	if err != nil {
 		level.Error(logger).Log("err", err)
 		os.Exit(1)
+	}
+	if peer != nil {
+		c := peer.AddState("nfl", notificationLog)
+		notificationLog.SetBroadcast(c.Broadcast)
 	}
 
 	marker := types.NewMarker()
@@ -200,21 +234,15 @@ func main() {
 		Logger:       log.With(logger, "component", "silences"),
 		Metrics:      prometheus.DefaultRegisterer,
 	}
-	if *meshListen != "" {
-		silenceOpts.Gossip = func(g mesh.Gossiper) mesh.Gossip {
-			res, err := mrouter.NewGossip("silences", g)
-			if err != nil {
-				level.Error(logger).Log("err", err)
-				os.Exit(1)
-			}
-			return res
-		}
-	}
-	silences, err := silence.New(silenceOpts)
 
+	silences, err := silence.New(silenceOpts)
 	if err != nil {
 		level.Error(logger).Log("err", err)
 		os.Exit(1)
+	}
+	if peer != nil {
+		c := peer.AddState("sil", silences)
+		silences.SetBroadcast(c.Broadcast)
 	}
 
 	// Start providers before router potentially sends updates.
@@ -224,20 +252,12 @@ func main() {
 		wg.Done()
 	}()
 
-	// Disable mesh if empty string passed for mesh.listen-address flag.
-	if *meshListen != "" {
-		mrouter.Start()
-		mrouter.ConnectionMaker.InitiateConnections(peers.slice(), true)
-	}
-
 	defer func() {
 		close(stopc)
-		// Stop receiving updates from router before shutting down.
-		mrouter.Stop()
 		wg.Wait()
 	}()
 
-	alerts, err := mem.NewAlerts(marker, 30*time.Minute, *dataDir)
+	alerts, err := mem.NewAlerts(marker, *alertGCInterval)
 	if err != nil {
 		level.Error(logger).Log("err", err)
 		os.Exit(1)
@@ -259,7 +279,7 @@ func main() {
 			return disp.Groups(matchers)
 		},
 		marker.Status,
-		mrouter,
+		peer,
 		logger,
 	)
 
@@ -270,8 +290,8 @@ func main() {
 	}
 
 	waitFunc := func() time.Duration { return 0 }
-	if *meshListen != "" {
-		waitFunc = meshWait(mrouter, 5*time.Second)
+	if peer != nil {
+		waitFunc = clusterWait(peer, *peerTimeout)
 	}
 	timeoutFunc := func(d time.Duration) time.Duration {
 		if d < notify.MinTimeout {
@@ -324,6 +344,7 @@ func main() {
 			silences,
 			notificationLog,
 			marker,
+			peer,
 			logger,
 		)
 		disp = dispatch.NewDispatcher(alerts, dispatch.NewRoute(conf.Route, nil), pipeline, marker, timeoutFunc, logger)
@@ -345,17 +366,17 @@ func main() {
 
 	*routePrefix = "/" + strings.Trim(*routePrefix, "/")
 
-	router := route.New()
+	router := route.New().WithInstrumentation(instrumentHandler)
 
 	if *routePrefix != "/" {
 		router = router.WithPrefix(*routePrefix)
 	}
 
-	webReload := make(chan struct{})
+	webReload := make(chan chan error)
 
 	ui.Register(router, webReload, logger)
 
-	apiv.Register(router.WithPrefix("/api"))
+	apiv.Register(router.WithPrefix("/api/v1"))
 
 	level.Info(logger).Log("msg", "Listening", "address", *listenAddress)
 	go listen(*listenAddress, router, logger)
@@ -363,7 +384,7 @@ func main() {
 	var (
 		hup      = make(chan os.Signal)
 		hupReady = make(chan bool)
-		term     = make(chan os.Signal)
+		term     = make(chan os.Signal, 1)
 	)
 	signal.Notify(hup, syscall.SIGHUP)
 	signal.Notify(term, os.Interrupt, syscall.SIGTERM)
@@ -373,9 +394,10 @@ func main() {
 		for {
 			select {
 			case <-hup:
-			case <-webReload:
+				reload()
+			case errc := <-webReload:
+				errc <- reload()
 			}
-			reload()
 		}
 	}()
 
@@ -387,77 +409,12 @@ func main() {
 	level.Info(logger).Log("msg", "Received SIGTERM, exiting gracefully...")
 }
 
-type peerDescSlice []mesh.PeerDescription
-
-func (s peerDescSlice) Len() int           { return len(s) }
-func (s peerDescSlice) Less(i, j int) bool { return s[i].UID < s[j].UID }
-func (s peerDescSlice) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
-
-// meshWait returns a function that inspects the current peer state and returns
+// clusterWait returns a function that inspects the current peer state and returns
 // a duration of one base timeout for each peer with a higher ID than ourselves.
-func meshWait(r *mesh.Router, timeout time.Duration) func() time.Duration {
+func clusterWait(p *cluster.Peer, timeout time.Duration) func() time.Duration {
 	return func() time.Duration {
-		var peers peerDescSlice
-		for _, desc := range r.Peers.Descriptions() {
-			peers = append(peers, desc)
-		}
-		sort.Sort(peers)
-
-		k := 0
-		for _, desc := range peers {
-			if desc.Self {
-				break
-			}
-			k++
-		}
-		peerPosition.Set(float64(k))
-		return time.Duration(k) * timeout
+		return time.Duration(p.Position()) * timeout
 	}
-}
-
-func initMesh(addr, hwaddr, nickname, pw string, logger log.Logger) (*mesh.Router, error) {
-	host, portStr, err := net.SplitHostPort(addr)
-
-	if err != nil {
-		level.Error(logger).Log("msg", "Invalid mesh address", "address", addr, "err", err)
-		os.Exit(1)
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		level.Error(logger).Log("msg", "Invalid mesh address", "address", addr, "err", err)
-		os.Exit(1)
-	}
-
-	name, err := mesh.PeerNameFromString(hwaddr)
-	if err != nil {
-		level.Error(logger).Log("msg", "Invalid hardware address", "address", hwaddr, "err", err)
-		os.Exit(1)
-	}
-
-	password := []byte(pw)
-	if len(password) == 0 {
-		// Emtpy password is used to disable secure communication. Using a nil
-		// password disables encryption in mesh.
-		password = nil
-	}
-
-	return mesh.NewRouter(mesh.Config{
-		Host:               host,
-		Port:               port,
-		ProtocolMinVersion: mesh.ProtocolMinVersion,
-		Password:           password,
-		ConnLimit:          64,
-		PeerDiscovery:      true,
-		TrustedSubnets:     []*net.IPNet{},
-	}, name, nickname, mesh.NullOverlay{}, printfLogger{logger})
-}
-
-type printfLogger struct {
-	log.Logger
-}
-
-func (l printfLogger) Printf(f string, args ...interface{}) {
-	level.Debug(l).Log(fmt.Sprintf(f, args...))
 }
 
 func extURL(listen, external string) (*url.URL, error) {
@@ -493,52 +450,6 @@ func listen(listen string, router *route.Router, logger log.Logger) {
 		level.Error(logger).Log("msg", "Listen error", "err", err)
 		os.Exit(1)
 	}
-}
-
-type stringset map[string]struct{}
-
-func (ss stringset) Set(value string) error {
-	for _, v := range strings.Split(value, ",") {
-		if v = strings.TrimSpace(v); v != "" {
-			ss[v] = struct{}{}
-		}
-	}
-	return nil
-}
-
-func (ss stringset) String() string {
-	return strings.Join(ss.slice(), ",")
-}
-
-func (ss stringset) slice() []string {
-	slice := make([]string, 0, len(ss))
-	for k := range ss {
-		slice = append(slice, k)
-	}
-	sort.Strings(slice)
-	return slice
-}
-
-func mustHardwareAddr() string {
-	// TODO(fabxc): consider a safe-guard against colliding MAC addresses.
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		panic(err)
-	}
-	for _, iface := range ifaces {
-		if s := iface.HardwareAddr.String(); s != "" {
-			return s
-		}
-	}
-	panic("no valid network interfaces")
-}
-
-func mustHostname() string {
-	hostname, err := os.Hostname()
-	if err != nil {
-		panic(err)
-	}
-	return hostname
 }
 
 func md5HashAsMetricValue(data []byte) float64 {

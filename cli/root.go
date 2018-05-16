@@ -1,83 +1,103 @@
 package cli
 
 import (
-	"fmt"
+	"net/url"
 	"os"
 
+	"github.com/prometheus/common/version"
+	"gopkg.in/alecthomas/kingpin.v2"
+
+	"github.com/prometheus/alertmanager/cli/config"
 	"github.com/prometheus/alertmanager/cli/format"
-	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
 )
 
-// RootCmd represents the base command when called without any subcommands
-var RootCmd = &cobra.Command{
-	Use:   "amtool",
-	Short: "Alertmanager CLI",
-	Long: `View and modify the current Alertmanager state.
+var (
+	verbose         bool
+	alertmanagerURL *url.URL
+	output          string
 
-[Config File]
+	configFiles = []string{os.ExpandEnv("$HOME/.config/amtool/config.yml"), "/etc/amtool/config.yml"}
+	legacyFlags = map[string]string{"comment_required": "require-comment"}
+)
 
-The alertmanager tool will read a config file from the --config cli argument, AMTOOL_CONFIG environment variable or
-from one of two default config locations. Valid config file formats are JSON, TOML, YAML, HCL and Java Properties, use
-whatever makes sense for your project.
+func requireAlertManagerURL(pc *kingpin.ParseContext) error {
+	// Return without error if any help flag is set.
+	for _, elem := range pc.Elements {
+		f, ok := elem.Clause.(*kingpin.FlagClause)
+		if !ok {
+			continue
+		}
+		name := f.Model().Name
+		if name == "help" || name == "help-long" || name == "help-man" {
+			return nil
+		}
+	}
+	if alertmanagerURL == nil {
+		kingpin.Fatalf("required flag --alertmanager.url not provided")
+	}
+	return nil
+}
 
-The default config file paths are $HOME/.config/amtool/config.yml or /etc/amtool/config.yml
+func Execute() {
+	var (
+		app = kingpin.New("amtool", helpRoot).DefaultEnvars()
+	)
 
-The accepted config options are as follows:
+	format.InitFormatFlags(app)
+
+	app.Flag("verbose", "Verbose running information").Short('v').BoolVar(&verbose)
+	app.Flag("alertmanager.url", "Alertmanager to talk to").URLVar(&alertmanagerURL)
+	app.Flag("output", "Output formatter (simple, extended, json)").Short('o').Default("simple").EnumVar(&output, "simple", "extended", "json")
+	app.Version(version.Print("amtool"))
+	app.GetFlag("help").Short('h')
+	app.UsageTemplate(kingpin.CompactUsageTemplate)
+
+	resolver, err := config.NewResolver(configFiles, legacyFlags)
+	if err != nil {
+		kingpin.Fatalf("could not load config file: %v\n", err)
+	}
+
+	configureAlertCmd(app)
+	configureSilenceCmd(app)
+	configureCheckConfigCmd(app)
+	configureConfigCmd(app)
+
+	err = resolver.Bind(app, os.Args[1:])
+	if err != nil {
+		kingpin.Fatalf("%v\n", err)
+	}
+
+	_, err = app.Parse(os.Args[1:])
+	if err != nil {
+		kingpin.Fatalf("%v\n", err)
+	}
+}
+
+const (
+	helpRoot = `View and modify the current Alertmanager state.
+
+Config File:
+The alertmanager tool will read a config file in YAML format from one of two
+default config locations: $HOME/.config/amtool/config.yml or
+/etc/amtool/config.yml
+
+All flags can be given in the config file, but the following are the suited for
+static configuration:
 
 	alertmanager.url
 		Set a default alertmanager url for each request
 
 	author
-		Set a default author value for new silences. If this argument is not specified then the username will be used
+		Set a default author value for new silences. If this argument is not
+		specified then the username will be used
 
-	comment_required
-		Require a comment on silence creation
+	require-comment
+		Bool, whether to require a comment on silence creation. Defaults to true
 
 	output
 		Set a default output type. Options are (simple, extended, json)
-	`,
-}
 
-// Execute adds all child commands to the root command sets flags appropriately.
-// This is called by main.main(). It only needs to happen once to the rootCmd.
-func Execute() {
-	if err := RootCmd.Execute(); err != nil {
-		os.Exit(1)
-	}
-}
-
-func init() {
-	cobra.OnInitialize(initConfig)
-
-	RootCmd.PersistentFlags().String("config", "", "config file (default is $HOME/.config/amtool/config.yml)")
-	viper.BindPFlag("config", RootCmd.PersistentFlags().Lookup("config"))
-	RootCmd.PersistentFlags().String("alertmanager.url", "", "Alertmanager to talk to")
-	viper.BindPFlag("alertmanager.url", RootCmd.PersistentFlags().Lookup("alertmanager.url"))
-	RootCmd.PersistentFlags().StringP("output", "o", "simple", "Output formatter (simple, extended, json)")
-	viper.BindPFlag("output", RootCmd.PersistentFlags().Lookup("output"))
-	RootCmd.PersistentFlags().BoolP("verbose", "v", false, "Verbose running information")
-	viper.BindPFlag("verbose", RootCmd.PersistentFlags().Lookup("verbose"))
-	viper.SetDefault("date.format", format.DefaultDateFormat)
-}
-
-// initConfig reads in config file and ENV variables if set.
-func initConfig() {
-	viper.SetConfigName("config") // name of config file (without extension)
-	viper.AddConfigPath("/etc/amtool")
-	viper.AddConfigPath("$HOME/.config/amtool")
-	viper.SetEnvPrefix("AMTOOL")
-	viper.AutomaticEnv() // read in environment variables that match
-
-	// If a config file is found, read it in.
-	cfgFile := viper.GetString("config")
-	if cfgFile != "" { // enable ability to specify config file via flag
-		viper.SetConfigFile(cfgFile)
-	}
-	err := viper.ReadInConfig()
-	if err == nil {
-		if viper.GetBool("verbose") {
-			fmt.Fprintln(os.Stderr, "Using config file:", viper.ConfigFileUsed())
-		}
-	}
-}
+	date.format
+		Sets the output format for dates. Defaults to "2006-01-02 15:04:05 MST"
+`
+)

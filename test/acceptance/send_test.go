@@ -33,10 +33,10 @@ func TestMergeAlerts(t *testing.T) {
 	conf := `
 route:
   receiver: "default"
-  group_by: []
+  group_by: [alertname]
   group_wait:      1s
   group_interval:  1s
-  repeat_interval: 0s
+  repeat_interval: 1ms
 
 receivers:
 - name: "default"
@@ -109,10 +109,10 @@ func TestRepeat(t *testing.T) {
 	conf := `
 route:
   receiver: "default"
-  group_by: []
+  group_by: [alertname]
   group_wait:      1s
   group_interval:  1s
-  repeat_interval: 0s 
+  repeat_interval: 1ms
 
 receivers:
 - name: "default"
@@ -168,7 +168,7 @@ func TestRetry(t *testing.T) {
 	conf := `
 route:
   receiver: "default"
-  group_by: []
+  group_by: [alertname]
   group_wait:      1s
   group_interval:  1s
   repeat_interval: 3s
@@ -215,7 +215,8 @@ route:
   group_by: []
   group_wait:      1s
   group_interval:  1s
-  repeat_interval: 5s
+  # use a value slightly below the 5s interval to avoid timing issues
+  repeat_interval: 4900ms
 
 receivers:
 - name: "default"
@@ -283,7 +284,7 @@ global:
 route:
   receiver: "default"
   group_by: [alertname]
-  group_wait: 1s 
+  group_wait: 1s
   group_interval: 5s
 
 receivers:
@@ -386,10 +387,8 @@ receivers:
 		Alert("alertname", "test", "lbl", "v2").Active(1),
 		Alert("alertname", "test", "lbl", "v3").Active(3),
 	)
-	co1.Want(Between(12, 12.5),
-		Alert("alertname", "test", "lbl", "v2").Active(1, 11),
-		Alert("alertname", "test", "lbl", "v3").Active(3),
-	)
+	// no notification should be sent after group_interval because no new alert has been fired
+	co1.Want(Between(12, 12.5))
 
 	co2.Want(Between(2, 2.5),
 		Alert("alertname", "test", "lbl", "v1").Active(1),
@@ -399,6 +398,7 @@ receivers:
 		Alert("alertname", "test", "lbl", "v2").Active(1),
 		Alert("alertname", "test", "lbl", "v3").Active(3),
 	)
+	co1.Want(Between(12, 12.5))
 
 	at.Run()
 }
@@ -406,10 +406,9 @@ receivers:
 func TestReload(t *testing.T) {
 	t.Parallel()
 
-	// We create a notification config that fans out into two different
-	// webhooks.
-	// The succeeding one must still only receive the first successful
-	// notifications. Sending to the succeeding one must eventually succeed.
+	// This integration test ensures that the first alert isn't notified twice
+	// and repeat_interval applies after the AlertManager process has been
+	// reloaded.
 	conf := `
 route:
   receiver: "default"

@@ -1,11 +1,11 @@
-module Status.Types exposing (StatusResponse, VersionInfo, MeshStatus, MeshPeer)
+module Status.Types exposing (StatusResponse, VersionInfo, ClusterStatus, ClusterPeer)
 
 
 type alias StatusResponse =
     { config : String
     , uptime : String
     , versionInfo : VersionInfo
-    , meshStatus : Maybe MeshStatus
+    , clusterStatus : Maybe ClusterStatus
     }
 
 
@@ -19,15 +19,14 @@ type alias VersionInfo =
     }
 
 
-type alias MeshStatus =
+type alias ClusterStatus =
     { name : String
-    , nickName : String
-    , peers : List MeshPeer
+    , status : String
+    , peers : List ClusterPeer
     }
 
 
-type alias MeshPeer =
+type alias ClusterPeer =
     { name : String
-    , nickName : String
-    , uid : Int
+    , address : String
     }

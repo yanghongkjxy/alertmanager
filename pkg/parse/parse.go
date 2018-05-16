@@ -9,7 +9,7 @@ import (
 )
 
 var (
-	re      = regexp.MustCompile(`(?:\s?)(\w+)(=|=~|!=|!~)(?:\"([^"=~!]+)\"|([^"=~!]+))`)
+	re      = regexp.MustCompile(`(?:\s?)(\w+)(=|=~|!=|!~)(?:\"([^"=~!]+)\"|([^"=~!]+)|\"\")`)
 	typeMap = map[string]labels.MatchType{
 		"=":  labels.MatchEqual,
 		"!=": labels.MatchNotEqual,
@@ -53,7 +53,7 @@ func Matcher(s string) (*labels.Matcher, error) {
 func Input(s string) (name, value string, matchType labels.MatchType, err error) {
 	ms := re.FindStringSubmatch(s)
 	if len(ms) < 4 {
-		return "", "", labels.MatchEqual, fmt.Errorf("bad matcher format")
+		return "", "", labels.MatchEqual, fmt.Errorf("bad matcher format: %s", s)
 	}
 
 	var prs bool
@@ -66,7 +66,7 @@ func Input(s string) (name, value string, matchType labels.MatchType, err error)
 		value = ms[4]
 	}
 
-	if name == "" || value == "" || !prs {
+	if name == "" || !prs {
 		return "", "", labels.MatchEqual, fmt.Errorf("failed to parse")
 	}
 

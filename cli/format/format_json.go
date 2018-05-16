@@ -5,33 +5,33 @@ import (
 	"io"
 	"os"
 
-	"github.com/prometheus/alertmanager/dispatch"
+	"github.com/prometheus/alertmanager/client"
 	"github.com/prometheus/alertmanager/types"
 )
 
-type JsonFormatter struct {
+type JSONFormatter struct {
 	writer io.Writer
 }
 
 func init() {
-	Formatters["json"] = &JsonFormatter{writer: os.Stdout}
+	Formatters["json"] = &JSONFormatter{writer: os.Stdout}
 }
 
-func (formatter *JsonFormatter) SetOutput(writer io.Writer) {
+func (formatter *JSONFormatter) SetOutput(writer io.Writer) {
 	formatter.writer = writer
 }
 
-func (formatter *JsonFormatter) FormatSilences(silences []types.Silence) error {
+func (formatter *JSONFormatter) FormatSilences(silences []types.Silence) error {
 	enc := json.NewEncoder(formatter.writer)
 	return enc.Encode(silences)
 }
 
-func (formatter *JsonFormatter) FormatAlerts(alerts []*dispatch.APIAlert) error {
+func (formatter *JSONFormatter) FormatAlerts(alerts []*client.ExtendedAlert) error {
 	enc := json.NewEncoder(formatter.writer)
 	return enc.Encode(alerts)
 }
 
-func (formatter *JsonFormatter) FormatConfig(config Config) error {
+func (formatter *JSONFormatter) FormatConfig(status *client.ServerStatus) error {
 	enc := json.NewEncoder(formatter.writer)
-	return enc.Encode(config)
+	return enc.Encode(status)
 }

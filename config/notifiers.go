@@ -15,8 +15,11 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
+
+	commoncfg "github.com/prometheus/common/config"
 )
 
 var (
@@ -69,6 +72,7 @@ var (
 		Pretext:   `{{ template "slack.default.pretext" . }}`,
 		Text:      `{{ template "slack.default.text" . }}`,
 		Fallback:  `{{ template "slack.default.fallback" . }}`,
+		Footer:    `{{ template "slack.default.footer" . }}`,
 	}
 
 	// DefaultHipchatConfig defines default values for Hipchat configurations.
@@ -92,6 +96,19 @@ var (
 		Description: `{{ template "opsgenie.default.description" . }}`,
 		Source:      `{{ template "opsgenie.default.source" . }}`,
 		// TODO: Add a details field with all the alerts.
+	}
+
+	// DefaultWechatConfig defines default values for wechat configurations.
+	DefaultWechatConfig = WechatConfig{
+		NotifierConfig: NotifierConfig{
+			VSendResolved: false,
+		},
+		Message:   `{{ template "wechat.default.message" . }}`,
+		APISecret: `{{ template "wechat.default.api_secret" . }}`,
+		ToUser:    `{{ template "wechat.default.to_user" . }}`,
+		ToParty:   `{{ template "wechat.default.to_party" . }}`,
+		ToTag:     `{{ template "wechat.default.to_tag" . }}`,
+		AgentID:   `{{ template "wechat.default.agent_id" . }}`,
 	}
 
 	// DefaultVictorOpsConfig defines default values for VictorOps configurations.
@@ -145,9 +162,6 @@ type EmailConfig struct {
 	HTML         string            `yaml:"html,omitempty" json:"html,omitempty"`
 	Text         string            `yaml:"text,omitempty" json:"text,omitempty"`
 	RequireTLS   *bool             `yaml:"require_tls,omitempty" json:"require_tls,omitempty"`
-
-	// Catches all undefined fields and must be empty after parsing.
-	XXX map[string]interface{} `yaml:",inline" json:"-"`
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
@@ -171,22 +185,26 @@ func (c *EmailConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	}
 	c.Headers = normalizedHeaders
 
-	return checkOverflow(c.XXX, "email config")
+	return nil
 }
 
 // PagerdutyConfig configures notifications via PagerDuty.
 type PagerdutyConfig struct {
 	NotifierConfig `yaml:",inline" json:",inline"`
 
-	ServiceKey  Secret            `yaml:"service_key,omitempty" json:"service_key,omitempty"`
+	HTTPConfig *commoncfg.HTTPClientConfig `yaml:"http_config,omitempty" json:"http_config,omitempty"`
+
+	ServiceKey  Secret            `yaml:"service_key,omitempty" json"service_key,omitempty"`
+	RoutingKey  Secret            `yaml:"routing_key,omitempty" json:"routing_key,omitempty"`
 	URL         string            `yaml:"url,omitempty" json:"url,omitempty"`
 	Client      string            `yaml:"client,omitempty" json:"client,omitempty"`
 	ClientURL   string            `yaml:"client_url,omitempty" json:"client_url,omitempty"`
 	Description string            `yaml:"description,omitempty" json:"description,omitempty"`
 	Details     map[string]string `yaml:"details,omitempty" json:"details,omitempty"`
-
-	// Catches all undefined fields and must be empty after parsing.
-	XXX map[string]interface{} `yaml:",inline" json:"-"`
+	Severity    string            `yaml:"severity,omitempty" json:"severity,omitempty"`
+	Class       string            `yaml:"class,omitempty" json:"class,omitempty"`
+	Component   string            `yaml:"component,omitempty" json:"component,omitempty"`
+	Group       string            `yaml:"group,omitempty" json:"group,omitempty"`
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
@@ -196,15 +214,70 @@ func (c *PagerdutyConfig) UnmarshalYAML(unmarshal func(interface{}) error) error
 	if err := unmarshal((*plain)(c)); err != nil {
 		return err
 	}
-	if c.ServiceKey == "" {
-		return fmt.Errorf("missing service key in PagerDuty config")
+	if c.RoutingKey == "" && c.ServiceKey == "" {
+		return fmt.Errorf("missing service or routing key in PagerDuty config")
 	}
-	return checkOverflow(c.XXX, "pagerduty config")
+	return nil
+}
+
+// SlackAction configures a single Slack action that is sent with each notification.
+// Each action must contain a type, text, and url.
+// See https://api.slack.com/docs/message-attachments#action_fields for more information.
+type SlackAction struct {
+	Type  string `yaml:"type,omitempty"  json:"type,omitempty"`
+	Text  string `yaml:"text,omitempty"  json:"text,omitempty"`
+	URL   string `yaml:"url,omitempty"   json:"url,omitempty"`
+	Style string `yaml:"style,omitempty" json:"style,omitempty"`
+}
+
+// UnmarshalYAML implements the yaml.Unmarshaler interface for SlackAction.
+func (c *SlackAction) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	type plain SlackAction
+	if err := unmarshal((*plain)(c)); err != nil {
+		return err
+	}
+	if c.Type == "" {
+		return fmt.Errorf("missing type in Slack action configuration")
+	}
+	if c.Text == "" {
+		return fmt.Errorf("missing value in Slack text configuration")
+	}
+	if c.URL == "" {
+		return fmt.Errorf("missing value in Slack url configuration")
+	}
+	return nil
+}
+
+// SlackField configures a single Slack field that is sent with each notification.
+// Each field must contain a title, value, and optionally, a boolean value to indicate if the field
+// is short enough to be displayed next to other fields designated as short.
+// See https://api.slack.com/docs/message-attachments#fields for more information.
+type SlackField struct {
+	Title string `yaml:"title,omitempty" json:"title,omitempty"`
+	Value string `yaml:"value,omitempty" json:"value,omitempty"`
+	Short *bool  `yaml:"short,omitempty" json:"short,omitempty"`
+}
+
+// UnmarshalYAML implements the yaml.Unmarshaler interface for SlackField.
+func (c *SlackField) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	type plain SlackField
+	if err := unmarshal((*plain)(c)); err != nil {
+		return err
+	}
+	if c.Title == "" {
+		return fmt.Errorf("missing title in Slack field configuration")
+	}
+	if c.Value == "" {
+		return fmt.Errorf("missing value in Slack field configuration")
+	}
+	return nil
 }
 
 // SlackConfig configures notifications via Slack.
 type SlackConfig struct {
 	NotifierConfig `yaml:",inline" json:",inline"`
+
+	HTTPConfig *commoncfg.HTTPClientConfig `yaml:"http_config,omitempty" json:"http_config,omitempty"`
 
 	APIURL Secret `yaml:"api_url,omitempty" json:"api_url,omitempty"`
 
@@ -213,32 +286,32 @@ type SlackConfig struct {
 	Username string `yaml:"username,omitempty" json:"username,omitempty"`
 	Color    string `yaml:"color,omitempty" json:"color,omitempty"`
 
-	Title     string `yaml:"title,omitempty" json:"title,omitempty"`
-	TitleLink string `yaml:"title_link,omitempty" json:"title_link,omitempty"`
-	Pretext   string `yaml:"pretext,omitempty" json:"pretext,omitempty"`
-	Text      string `yaml:"text,omitempty" json:"text,omitempty"`
-	Fallback  string `yaml:"fallback,omitempty" json:"fallback,omitempty"`
-	IconEmoji string `yaml:"icon_emoji,omitempty" json:"icon_emoji,omitempty"`
-	IconURL   string `yaml:"icon_url,omitempty" json:"icon_url,omitempty"`
-	LinkNames bool   `yaml:"link_names,omitempty" json:"link_names,omitempty"`
-
-	// Catches all undefined fields and must be empty after parsing.
-	XXX map[string]interface{} `yaml:",inline" json:"-"`
+	Title       string         `yaml:"title,omitempty" json:"title,omitempty"`
+	TitleLink   string         `yaml:"title_link,omitempty" json:"title_link,omitempty"`
+	Pretext     string         `yaml:"pretext,omitempty" json:"pretext,omitempty"`
+	Text        string         `yaml:"text,omitempty" json:"text,omitempty"`
+	Fields      []*SlackField  `yaml:"fields,omitempty" json:"fields,omitempty"`
+	ShortFields bool           `yaml:"short_fields,omitempty" json:"short_fields,omitempty"`
+	Footer      string         `yaml:"footer,omitempty" json:"footer,omitempty"`
+	Fallback    string         `yaml:"fallback,omitempty" json:"fallback,omitempty"`
+	IconEmoji   string         `yaml:"icon_emoji,omitempty" json:"icon_emoji,omitempty"`
+	IconURL     string         `yaml:"icon_url,omitempty" json:"icon_url,omitempty"`
+	LinkNames   bool           `yaml:"link_names,omitempty" json:"link_names,omitempty"`
+	Actions     []*SlackAction `yaml:"actions,omitempty" json:"actions,omitempty"`
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
 func (c *SlackConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	*c = DefaultSlackConfig
 	type plain SlackConfig
-	if err := unmarshal((*plain)(c)); err != nil {
-		return err
-	}
-	return checkOverflow(c.XXX, "slack config")
+	return unmarshal((*plain)(c))
 }
 
 // HipchatConfig configures notifications via Hipchat.
 type HipchatConfig struct {
 	NotifierConfig `yaml:",inline" json:",inline"`
+
+	HTTPConfig *commoncfg.HTTPClientConfig `yaml:"http_config,omitempty" json:"http_config,omitempty"`
 
 	APIURL        string `yaml:"api_url,omitempty" json:"api_url,omitempty"`
 	AuthToken     Secret `yaml:"auth_token,omitempty" json:"auth_token,omitempty"`
@@ -248,9 +321,6 @@ type HipchatConfig struct {
 	Message       string `yaml:"message,omitempty" json:"message,omitempty"`
 	MessageFormat string `yaml:"message_format,omitempty" json:"message_format,omitempty"`
 	Color         string `yaml:"color,omitempty" json:"color,omitempty"`
-
-	// Catches all undefined fields and must be empty after parsing.
-	XXX map[string]interface{} `yaml:",inline" ,json:"-"`
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
@@ -263,19 +333,17 @@ func (c *HipchatConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	if c.RoomID == "" {
 		return fmt.Errorf("missing room id in Hipchat config")
 	}
-
-	return checkOverflow(c.XXX, "hipchat config")
+	return nil
 }
 
 // WebhookConfig configures notifications via a generic webhook.
 type WebhookConfig struct {
 	NotifierConfig `yaml:",inline" json:",inline"`
 
+	HTTPConfig *commoncfg.HTTPClientConfig `yaml:"http_config,omitempty" json:"http_config,omitempty"`
+
 	// URL to send POST request to.
 	URL string `yaml:"url" json:"url"`
-
-	// Catches all undefined fields and must be empty after parsing.
-	XXX map[string]interface{} `yaml:",inline" json:"-"`
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
@@ -288,15 +356,57 @@ func (c *WebhookConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	if c.URL == "" {
 		return fmt.Errorf("missing URL in webhook config")
 	}
-	return checkOverflow(c.XXX, "webhook config")
+	url, err := url.Parse(c.URL)
+	if err != nil {
+		return err
+	}
+	if url.Scheme != "https" && url.Scheme != "http" {
+		return fmt.Errorf("scheme required for webhook url")
+	}
+	c.URL = url.String()
+	return nil
+}
+
+// WechatConfig configures notifications via Wechat.
+type WechatConfig struct {
+	NotifierConfig `yaml:",inline" json:",inline"`
+
+	HTTPConfig *commoncfg.HTTPClientConfig `yaml:"http_config,omitempty" json:"http_config,omitempty"`
+
+	APISecret Secret `yaml:"api_secret,omitempty" json:"api_secret,omitempty"`
+	CorpID    string `yaml:"corp_id,omitempty" json:"corp_id,omitempty"`
+	Message   string `yaml:"message,omitempty" json:"message,omitempty"`
+	APIURL    string `yaml:"api_url,omitempty" json:"api_url,omitempty"`
+	ToUser    string `yaml:"to_user,omitempty" json:"to_user,omitempty"`
+	ToParty   string `yaml:"to_party,omitempty" json:"to_party,omitempty"`
+	ToTag     string `yaml:"to_tag,omitempty" json:"to_tag,omitempty"`
+	AgentID   string `yaml:"agent_id,omitempty" json:"agent_id,omitempty"`
+}
+
+// UnmarshalYAML implements the yaml.Unmarshaler interface.
+func (c *WechatConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	*c = DefaultWechatConfig
+	type plain WechatConfig
+	if err := unmarshal((*plain)(c)); err != nil {
+		return err
+	}
+	if c.APISecret == "" {
+		return fmt.Errorf("missing Wechat APISecret in Wechat config")
+	}
+	if c.CorpID == "" {
+		return fmt.Errorf("missing Wechat CorpID in Wechat config")
+	}
+	return nil
 }
 
 // OpsGenieConfig configures notifications via OpsGenie.
 type OpsGenieConfig struct {
 	NotifierConfig `yaml:",inline" json:",inline"`
 
+	HTTPConfig *commoncfg.HTTPClientConfig `yaml:"http_config,omitempty" json:"http_config,omitempty"`
+
 	APIKey      Secret            `yaml:"api_key,omitempty" json:"api_key,omitempty"`
-	APIHost     string            `yaml:"api_host,omitempty" json:"api_host,omitempty"`
+	APIURL      string            `yaml:"api_url,omitempty" json:"api_url,omitempty"`
 	Message     string            `yaml:"message,omitempty" json:"message,omitempty"`
 	Description string            `yaml:"description,omitempty" json:"description,omitempty"`
 	Source      string            `yaml:"source,omitempty" json:"source,omitempty"`
@@ -304,27 +414,21 @@ type OpsGenieConfig struct {
 	Teams       string            `yaml:"teams,omitempty" json:"teams,omitempty"`
 	Tags        string            `yaml:"tags,omitempty" json:"tags,omitempty"`
 	Note        string            `yaml:"note,omitempty" json:"note,omitempty"`
-
-	// Catches all undefined fields and must be empty after parsing.
-	XXX map[string]interface{} `yaml:",inline" json:"-"`
+	Priority    string            `yaml:"priority,omitempty" json:"priority,omitempty"`
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
 func (c *OpsGenieConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	*c = DefaultOpsGenieConfig
 	type plain OpsGenieConfig
-	if err := unmarshal((*plain)(c)); err != nil {
-		return err
-	}
-	if c.APIKey == "" {
-		return fmt.Errorf("missing API key in OpsGenie config")
-	}
-	return checkOverflow(c.XXX, "opsgenie config")
+	return unmarshal((*plain)(c))
 }
 
 // VictorOpsConfig configures notifications via VictorOps.
 type VictorOpsConfig struct {
 	NotifierConfig `yaml:",inline" json:",inline"`
+
+	HTTPConfig *commoncfg.HTTPClientConfig `yaml:"http_config,omitempty" json:"http_config,omitempty"`
 
 	APIKey            Secret `yaml:"api_key" json:"api_key"`
 	APIURL            string `yaml:"api_url" json:"api_url"`
@@ -333,8 +437,6 @@ type VictorOpsConfig struct {
 	StateMessage      string `yaml:"state_message" json:"state_message"`
 	EntityDisplayName string `yaml:"entity_display_name" json:"entity_display_name"`
 	MonitoringTool    string `yaml:"monitoring_tool" json:"monitoring_tool"`
-
-	XXX map[string]interface{} `yaml:",inline" json:"-"`
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
@@ -347,7 +449,7 @@ func (c *VictorOpsConfig) UnmarshalYAML(unmarshal func(interface{}) error) error
 	if c.RoutingKey == "" {
 		return fmt.Errorf("missing Routing key in VictorOps config")
 	}
-	return checkOverflow(c.XXX, "victorops config")
+	return nil
 }
 
 type duration time.Duration
@@ -367,6 +469,8 @@ func (d duration) MarshalText() ([]byte, error) {
 type PushoverConfig struct {
 	NotifierConfig `yaml:",inline" json:",inline"`
 
+	HTTPConfig *commoncfg.HTTPClientConfig `yaml:"http_config,omitempty" json:"http_config,omitempty"`
+
 	UserKey  Secret   `yaml:"user_key,omitempty" json:"user_key,omitempty"`
 	Token    Secret   `yaml:"token,omitempty" json:"token,omitempty"`
 	Title    string   `yaml:"title,omitempty" json:"title,omitempty"`
@@ -375,9 +479,6 @@ type PushoverConfig struct {
 	Priority string   `yaml:"priority,omitempty" json:"priority,omitempty"`
 	Retry    duration `yaml:"retry,omitempty" json:"retry,omitempty"`
 	Expire   duration `yaml:"expire,omitempty" json:"expire,omitempty"`
-
-	// Catches all undefined fields and must be empty after parsing.
-	XXX map[string]interface{} `yaml:",inline" json:"-"`
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
@@ -393,5 +494,5 @@ func (c *PushoverConfig) UnmarshalYAML(unmarshal func(interface{}) error) error 
 	if c.Token == "" {
 		return fmt.Errorf("missing token in Pushover config")
 	}
-	return checkOverflow(c.XXX, "pushover config")
+	return nil
 }

@@ -11,10 +11,11 @@ import Utils.Types exposing (ApiData)
 import Utils.Views exposing (checkbox, iconButtonMsg, validatedField, loading)
 import Utils.FormValidation exposing (ValidationState(..), ValidatedField)
 import Views.SilenceForm.Types exposing (Model, SilenceFormMsg(..), SilenceFormFieldMsg(..), SilenceForm)
+import Utils.Filter
 
 
-view : Maybe SilenceId -> Model -> Html SilenceFormMsg
-view maybeId { form, silenceId, alerts } =
+view : Maybe SilenceId -> List Utils.Filter.Matcher -> String -> Model -> Html SilenceFormMsg
+view maybeId matchers defaultCreator { form, silenceId, alerts } =
     let
         ( title, resetClick ) =
             case maybeId of
@@ -22,7 +23,7 @@ view maybeId { form, silenceId, alerts } =
                     ( "Edit Silence", FetchSilence silenceId )
 
                 Nothing ->
-                    ( "New Silence", NewSilenceFromMatchers [] )
+                    ( "New Silence", NewSilenceFromMatchers defaultCreator matchers )
     in
         div []
             [ h1 [] [ text title ]
@@ -59,19 +60,19 @@ timeInput startsAt endsAt duration =
             "Start"
             "col-5"
             (UpdateStartsAt >> UpdateField)
-            (ValidateStartsAt |> UpdateField)
+            (ValidateTime |> UpdateField)
             startsAt
         , validatedField input
             "Duration"
             "col-2"
             (UpdateDuration >> UpdateField)
-            (ValidateDuration |> UpdateField)
+            (ValidateTime |> UpdateField)
             duration
         , validatedField input
             "End"
             "col-5"
             (UpdateEndsAt >> UpdateField)
-            (ValidateEndsAt |> UpdateField)
+            (ValidateTime |> UpdateField)
             endsAt
         ]
 

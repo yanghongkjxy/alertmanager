@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	commoncfg "github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
 	"gopkg.in/yaml.v2"
 )
@@ -52,7 +53,7 @@ func (s Secret) MarshalJSON() ([]byte, error) {
 // Load parses the YAML input s into a Config.
 func Load(s string) (*Config, error) {
 	cfg := &Config{}
-	err := yaml.Unmarshal([]byte(s), cfg)
+	err := yaml.UnmarshalStrict([]byte(s), cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -110,22 +111,8 @@ type Config struct {
 	Receivers    []*Receiver    `yaml:"receivers,omitempty" json:"receivers,omitempty"`
 	Templates    []string       `yaml:"templates" json:"templates"`
 
-	// Catches all undefined fields and must be empty after parsing.
-	XXX map[string]interface{} `yaml:",inline" json:"-"`
-
 	// original is the input from which the config was parsed.
 	original string
-}
-
-func checkOverflow(m map[string]interface{}, ctx string) error {
-	if len(m) > 0 {
-		var keys []string
-		for k := range m {
-			keys = append(keys, k)
-		}
-		return fmt.Errorf("unknown fields in %s: %s", ctx, strings.Join(keys, ", "))
-	}
-	return nil
 }
 
 func (c Config) String() string {
@@ -158,6 +145,11 @@ func (c *Config) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	for _, rcv := range c.Receivers {
 		if _, ok := names[rcv.Name]; ok {
 			return fmt.Errorf("notification config name %q is not unique", rcv.Name)
+		}
+		for _, wh := range rcv.WebhookConfigs {
+			if wh.HTTPConfig == nil {
+				wh.HTTPConfig = c.Global.HTTPConfig
+			}
 		}
 		for _, ec := range rcv.EmailConfigs {
 			if ec.Smarthost == "" {
@@ -193,6 +185,9 @@ func (c *Config) UnmarshalYAML(unmarshal func(interface{}) error) error {
 			}
 		}
 		for _, sc := range rcv.SlackConfigs {
+			if sc.HTTPConfig == nil {
+				sc.HTTPConfig = c.Global.HTTPConfig
+			}
 			if sc.APIURL == "" {
 				if c.Global.SlackAPIURL == "" {
 					return fmt.Errorf("no global Slack API URL set")
@@ -201,11 +196,14 @@ func (c *Config) UnmarshalYAML(unmarshal func(interface{}) error) error {
 			}
 		}
 		for _, hc := range rcv.HipchatConfigs {
+			if hc.HTTPConfig == nil {
+				hc.HTTPConfig = c.Global.HTTPConfig
+			}
 			if hc.APIURL == "" {
-				if c.Global.HipchatURL == "" {
+				if c.Global.HipchatAPIURL == "" {
 					return fmt.Errorf("no global Hipchat API URL set")
 				}
-				hc.APIURL = c.Global.HipchatURL
+				hc.APIURL = c.Global.HipchatAPIURL
 			}
 			if !strings.HasSuffix(hc.APIURL, "/") {
 				hc.APIURL += "/"
@@ -217,7 +215,15 @@ func (c *Config) UnmarshalYAML(unmarshal func(interface{}) error) error {
 				hc.AuthToken = c.Global.HipchatAuthToken
 			}
 		}
+		for _, poc := range rcv.PushoverConfigs {
+			if poc.HTTPConfig == nil {
+				poc.HTTPConfig = c.Global.HTTPConfig
+			}
+		}
 		for _, pdc := range rcv.PagerdutyConfigs {
+			if pdc.HTTPConfig == nil {
+				pdc.HTTPConfig = c.Global.HTTPConfig
+			}
 			if pdc.URL == "" {
 				if c.Global.PagerdutyURL == "" {
 					return fmt.Errorf("no global PagerDuty URL set")
@@ -226,17 +232,59 @@ func (c *Config) UnmarshalYAML(unmarshal func(interface{}) error) error {
 			}
 		}
 		for _, ogc := range rcv.OpsGenieConfigs {
-			if ogc.APIHost == "" {
-				if c.Global.OpsGenieAPIHost == "" {
+			if ogc.HTTPConfig == nil {
+				ogc.HTTPConfig = c.Global.HTTPConfig
+			}
+			if ogc.APIURL == "" {
+				if c.Global.OpsGenieAPIURL == "" {
 					return fmt.Errorf("no global OpsGenie URL set")
 				}
-				ogc.APIHost = c.Global.OpsGenieAPIHost
+				ogc.APIURL = c.Global.OpsGenieAPIURL
 			}
-			if !strings.HasSuffix(ogc.APIHost, "/") {
-				ogc.APIHost += "/"
+			if !strings.HasSuffix(ogc.APIURL, "/") {
+				ogc.APIURL += "/"
+			}
+			if ogc.APIKey == "" {
+				if c.Global.OpsGenieAPIKey == "" {
+					return fmt.Errorf("no global OpsGenie API Key set")
+				}
+				ogc.APIKey = c.Global.OpsGenieAPIKey
+			}
+		}
+		for _, wcc := range rcv.WechatConfigs {
+			if wcc.HTTPConfig == nil {
+				wcc.HTTPConfig = c.Global.HTTPConfig
+			}
+
+			if wcc.APIURL == "" {
+				if c.Global.WeChatAPIURL == "" {
+					return fmt.Errorf("no global Wechat URL set")
+				}
+				wcc.APIURL = c.Global.WeChatAPIURL
+			}
+
+			if wcc.APISecret == "" {
+				if c.Global.WeChatAPISecret == "" {
+					return fmt.Errorf("no global Wechat ApiSecret set")
+				}
+				wcc.APISecret = c.Global.WeChatAPISecret
+			}
+
+			if wcc.CorpID == "" {
+				if c.Global.WeChatAPICorpID == "" {
+					return fmt.Errorf("no global Wechat CorpID set")
+				}
+				wcc.CorpID = c.Global.WeChatAPICorpID
+			}
+
+			if !strings.HasSuffix(wcc.APIURL, "/") {
+				wcc.APIURL += "/"
 			}
 		}
 		for _, voc := range rcv.VictorOpsConfigs {
+			if voc.HTTPConfig == nil {
+				voc.HTTPConfig = c.Global.HTTPConfig
+			}
 			if voc.APIURL == "" {
 				if c.Global.VictorOpsAPIURL == "" {
 					return fmt.Errorf("no global VictorOps URL set")
@@ -269,11 +317,7 @@ func (c *Config) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	}
 
 	// Validate that all receivers used in the routing tree are defined.
-	if err := checkReceiver(c.Route, names); err != nil {
-		return err
-	}
-
-	return checkOverflow(c.XXX, "config")
+	return checkReceiver(c.Route, names)
 }
 
 // checkReceiver returns an error if a node in the routing tree
@@ -296,11 +340,14 @@ func checkReceiver(r *Route, receivers map[string]struct{}) error {
 // DefaultGlobalConfig provides global default values.
 var DefaultGlobalConfig = GlobalConfig{
 	ResolveTimeout: model.Duration(5 * time.Minute),
+	HTTPConfig:     &commoncfg.HTTPClientConfig{},
 
+	SMTPHello:       "localhost",
 	SMTPRequireTLS:  true,
-	PagerdutyURL:    "https://events.pagerduty.com/generic/2010-04-15/create_event.json",
-	HipchatURL:      "https://api.hipchat.com/",
-	OpsGenieAPIHost: "https://api.opsgenie.com/",
+	PagerdutyURL:    "https://events.pagerduty.com/v2/enqueue",
+	HipchatAPIURL:   "https://api.hipchat.com/",
+	OpsGenieAPIURL:  "https://api.opsgenie.com/",
+	WeChatAPIURL:    "https://qyapi.weixin.qq.com/cgi-bin/",
 	VictorOpsAPIURL: "https://alert.victorops.com/integrations/generic/20131114/alert/",
 }
 
@@ -310,6 +357,8 @@ type GlobalConfig struct {
 	// ResolveTimeout is the time after which an alert is declared resolved
 	// if it has not been updated.
 	ResolveTimeout model.Duration `yaml:"resolve_timeout" json:"resolve_timeout"`
+
+	HTTPConfig *commoncfg.HTTPClientConfig `yaml:"http_config,omitempty" json:"http_config,omitempty"`
 
 	SMTPFrom         string `yaml:"smtp_from,omitempty" json:"smtp_from,omitempty"`
 	SMTPHello        string `yaml:"smtp_hello,omitempty" json:"smtp_hello,omitempty"`
@@ -321,24 +370,22 @@ type GlobalConfig struct {
 	SMTPRequireTLS   bool   `yaml:"smtp_require_tls,omitempty" json:"smtp_require_tls,omitempty"`
 	SlackAPIURL      Secret `yaml:"slack_api_url,omitempty" json:"slack_api_url,omitempty"`
 	PagerdutyURL     string `yaml:"pagerduty_url,omitempty" json:"pagerduty_url,omitempty"`
-	HipchatURL       string `yaml:"hipchat_url,omitempty" json:"hipchat_url,omitempty"`
+	HipchatAPIURL    string `yaml:"hipchat_api_url,omitempty" json:"hipchat_api_url,omitempty"`
 	HipchatAuthToken Secret `yaml:"hipchat_auth_token,omitempty" json:"hipchat_auth_token,omitempty"`
-	OpsGenieAPIHost  string `yaml:"opsgenie_api_host,omitempty" json:"opsgenie_api_host,omitempty"`
+	OpsGenieAPIURL   string `yaml:"opsgenie_api_url,omitempty" json:"opsgenie_api_url,omitempty"`
+	OpsGenieAPIKey   Secret `yaml:"opsgenie_api_key,omitempty" json:"opsgenie_api_key,omitempty"`
+	WeChatAPIURL     string `yaml:"wechat_api_url,omitempty" json:"wechat_api_url,omitempty"`
+	WeChatAPISecret  Secret `yaml:"wechat_api_secret,omitempty" json:"wechat_api_secret,omitempty"`
+	WeChatAPICorpID  string `yaml:"wechat_api_corp_id,omitempty" json:"wechat_api_corp_id,omitempty"`
 	VictorOpsAPIURL  string `yaml:"victorops_api_url,omitempty" json:"victorops_api_url,omitempty"`
 	VictorOpsAPIKey  Secret `yaml:"victorops_api_key,omitempty" json:"victorops_api_key,omitempty"`
-
-	// Catches all undefined fields and must be empty after parsing.
-	XXX map[string]interface{} `yaml:",inline" json:"-"`
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
 func (c *GlobalConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	*c = DefaultGlobalConfig
 	type plain GlobalConfig
-	if err := unmarshal((*plain)(c)); err != nil {
-		return err
-	}
-	return checkOverflow(c.XXX, "global")
+	return unmarshal((*plain)(c))
 }
 
 // A Route is a node that contains definitions of how to handle alerts.
@@ -354,9 +401,6 @@ type Route struct {
 	GroupWait      *model.Duration `yaml:"group_wait,omitempty" json:"group_wait,omitempty"`
 	GroupInterval  *model.Duration `yaml:"group_interval,omitempty" json:"group_interval,omitempty"`
 	RepeatInterval *model.Duration `yaml:"repeat_interval,omitempty" json:"repeat_interval,omitempty"`
-
-	// Catches all undefined fields and must be empty after parsing.
-	XXX map[string]interface{} `yaml:",inline" json:"-"`
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
@@ -387,7 +431,14 @@ func (r *Route) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		groupBy[ln] = struct{}{}
 	}
 
-	return checkOverflow(r.XXX, "route")
+	if r.GroupInterval != nil && time.Duration(*r.GroupInterval) == time.Duration(0) {
+		return fmt.Errorf("group_interval cannot be zero")
+	}
+	if r.RepeatInterval != nil && time.Duration(*r.RepeatInterval) == time.Duration(0) {
+		return fmt.Errorf("repeat_interval cannot be zero")
+	}
+
+	return nil
 }
 
 // InhibitRule defines an inhibition rule that mutes alerts that match the
@@ -409,9 +460,6 @@ type InhibitRule struct {
 	// A set of labels that must be equal between the source and target alert
 	// for them to be a match.
 	Equal model.LabelNames `yaml:"equal,omitempty" json:"equal,omitempty"`
-
-	// Catches all undefined fields and must be empty after parsing.
-	XXX map[string]interface{} `yaml:",inline" json:"-"`
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
@@ -445,7 +493,7 @@ func (r *InhibitRule) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		}
 	}
 
-	return checkOverflow(r.XXX, "inhibit rule")
+	return nil
 }
 
 // Receiver configuration provides configuration on how to contact a receiver.
@@ -459,11 +507,9 @@ type Receiver struct {
 	SlackConfigs     []*SlackConfig     `yaml:"slack_configs,omitempty" json:"slack_configs,omitempty"`
 	WebhookConfigs   []*WebhookConfig   `yaml:"webhook_configs,omitempty" json:"webhook_configs,omitempty"`
 	OpsGenieConfigs  []*OpsGenieConfig  `yaml:"opsgenie_configs,omitempty" json:"opsgenie_configs,omitempty"`
+	WechatConfigs    []*WechatConfig    `yaml:"wechat_configs,omitempty" json:"wechat_configs,omitempty"`
 	PushoverConfigs  []*PushoverConfig  `yaml:"pushover_configs,omitempty" json:"pushover_configs,omitempty"`
 	VictorOpsConfigs []*VictorOpsConfig `yaml:"victorops_configs,omitempty" json:"victorops_configs,omitempty"`
-
-	// Catches all undefined fields and must be empty after parsing.
-	XXX map[string]interface{} `yaml:",inline" json:"-"`
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
@@ -475,7 +521,7 @@ func (c *Receiver) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	if c.Name == "" {
 		return fmt.Errorf("missing name in receiver")
 	}
-	return checkOverflow(c.XXX, "receiver config")
+	return nil
 }
 
 // Regexp encapsulates a regexp.Regexp and makes it YAML marshalable.

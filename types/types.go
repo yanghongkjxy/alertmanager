@@ -14,8 +14,6 @@
 package types
 
 import (
-	"fmt"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -27,8 +25,8 @@ type AlertState string
 
 const (
 	AlertStateUnprocessed AlertState = "unprocessed"
-	AlertStateActive                 = "active"
-	AlertStateSuppressed             = "suppressed"
+	AlertStateActive      AlertState = "active"
+	AlertStateSuppressed  AlertState = "suppressed"
 )
 
 // AlertStatus stores the state and values associated with an Alert.
@@ -82,7 +80,7 @@ func (m *memMarker) Count(states ...AlertState) int {
 		for _, status := range m.m {
 			for _, state := range states {
 				if status.State == state {
-					count += 1
+					count++
 				}
 			}
 		}
@@ -358,6 +356,12 @@ type Silence struct {
 	Status SilenceStatus `json:"status"`
 }
 
+// Expired return if the silence is expired
+// meaning that both StartsAt and EndsAt are equal
+func (s *Silence) Expired() bool {
+	return s.StartsAt.Equal(s.EndsAt)
+}
+
 type SilenceStatus struct {
 	State SilenceState `json:"state"`
 }
@@ -379,72 +383,4 @@ func CalcSilenceState(start, end time.Time) SilenceState {
 		return SilenceStateActive
 	}
 	return SilenceStateExpired
-}
-
-// Validate returns true iff all fields of the silence have valid values.
-func (s *Silence) Validate() error {
-	if s.ID == "" {
-		return fmt.Errorf("ID missing")
-	}
-	if len(s.Matchers) == 0 {
-		return fmt.Errorf("at least one matcher required")
-	}
-	for _, m := range s.Matchers {
-		if err := m.Validate(); err != nil {
-			return fmt.Errorf("invalid matcher: %s", err)
-		}
-	}
-	if s.StartsAt.IsZero() {
-		return fmt.Errorf("start time missing")
-	}
-	if s.EndsAt.IsZero() {
-		return fmt.Errorf("end time missing")
-	}
-	if s.EndsAt.Before(s.StartsAt) {
-		return fmt.Errorf("start time must be before end time")
-	}
-	if s.CreatedBy == "" {
-		return fmt.Errorf("creator information missing")
-	}
-	if s.Comment == "" {
-		return fmt.Errorf("comment missing")
-	}
-	// if s.CreatedAt.IsZero() {
-	//	return fmt.Errorf("creation timestamp missing")
-	// }
-	return nil
-}
-
-// Init initializes a silence. Must be called before using Mutes.
-func (s *Silence) Init() error {
-	for _, m := range s.Matchers {
-		if err := m.Init(); err != nil {
-			return err
-		}
-	}
-	sort.Sort(s.Matchers)
-	return nil
-}
-
-// Mutes implements the Muter interface.
-//
-// TODO(fabxc): consider making this a function accepting a
-// timestamp and returning a Muter, i.e. s.Muter(ts).Mutes(lset).
-func (s *Silence) Mutes(lset model.LabelSet) bool {
-	var now time.Time
-	if s.now != nil {
-		now = s.now()
-	} else {
-		now = time.Now()
-	}
-	if now.Before(s.StartsAt) || now.After(s.EndsAt) {
-		return false
-	}
-	return s.Matchers.Match(lset)
-}
-
-// Deleted returns whether a silence is deleted. Semantically this means it had no effect
-// on history at any point.
-func (s *Silence) Deleted() bool {
-	return s.StartsAt.Equal(s.EndsAt)
 }

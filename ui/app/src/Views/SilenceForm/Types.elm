@@ -11,6 +11,7 @@ module Views.SilenceForm.Types
         , initSilenceForm
         , emptyMatcher
         , validateForm
+        , parseEndsAt
         )
 
 import Silences.Types exposing (Silence, SilenceId, nullSilence)
@@ -19,6 +20,7 @@ import Utils.Types exposing (Matcher, Duration, ApiData(..))
 import Time exposing (Time)
 import Utils.Date exposing (timeFromString, timeToString, durationFormat, parseDuration)
 import Time exposing (Time)
+import Utils.Filter
 import Utils.FormValidation
     exposing
         ( initialField
@@ -60,8 +62,8 @@ type SilenceFormMsg
     | PreviewSilence
     | AlertGroupsPreview (ApiData (List Alert))
     | FetchSilence String
-    | NewSilenceFromMatchers (List Matcher)
-    | NewSilenceFromMatchersAndTime (List Matcher) Time
+    | NewSilenceFromMatchers String (List Utils.Filter.Matcher)
+    | NewSilenceFromMatchersAndTime String (List Utils.Filter.Matcher) Time
     | SilenceFetch (ApiData Silence)
     | SilenceCreate (ApiData SilenceId)
 
@@ -70,11 +72,9 @@ type SilenceFormFieldMsg
     = AddMatcher
     | DeleteMatcher Int
     | UpdateStartsAt String
-    | ValidateStartsAt
     | UpdateEndsAt String
-    | ValidateEndsAt
     | UpdateDuration String
-    | ValidateDuration
+    | ValidateTime
     | UpdateCreatedBy String
     | ValidateCreatedBy
     | UpdateComment String
@@ -111,7 +111,7 @@ toSilence { id, comment, matchers, createdBy, startsAt, endsAt } =
         (List.foldr appendMatcher (Ok []) matchers)
         (stringNotEmpty createdBy.value)
         (timeFromString startsAt.value)
-        (timeFromString endsAt.value)
+        (parseEndsAt startsAt.value endsAt.value)
         |> Result.toMaybe
 
 
@@ -122,7 +122,7 @@ fromSilence { id, createdBy, comment, startsAt, endsAt, matchers } =
     , comment = initialField comment
     , startsAt = initialField (timeToString startsAt)
     , endsAt = initialField (timeToString endsAt)
-    , duration = initialField (durationFormat (endsAt - startsAt))
+    , duration = initialField (durationFormat (endsAt - startsAt) |> Maybe.withDefault "")
     , matchers = List.map fromMatcher matchers
     }
 
@@ -133,16 +133,29 @@ validateForm { id, createdBy, comment, startsAt, endsAt, duration, matchers } =
     , createdBy = validate stringNotEmpty createdBy
     , comment = validate stringNotEmpty comment
     , startsAt = validate timeFromString startsAt
-    , endsAt = validate timeFromString endsAt
+    , endsAt = validate (parseEndsAt startsAt.value) endsAt
     , duration = validate parseDuration duration
     , matchers = List.map validateMatcherForm matchers
     }
 
 
+parseEndsAt : String -> String -> Result String Time.Time
+parseEndsAt startsAt endsAt =
+    case ( timeFromString startsAt, timeFromString endsAt ) of
+        ( Ok starts, Ok ends ) ->
+            if starts > ends then
+                Err "Can't be in the past"
+            else
+                Ok ends
+
+        ( _, endsResult ) ->
+            endsResult
+
+
 validateMatcherForm : MatcherForm -> MatcherForm
 validateMatcherForm { name, value, isRegex } =
     { name = validate stringNotEmpty name
-    , value = validate stringNotEmpty value
+    , value = value
     , isRegex = isRegex
     }
 
@@ -172,25 +185,41 @@ defaultDuration =
     2 * Time.hour
 
 
-fromMatchersAndTime : List Matcher -> Time -> SilenceForm
-fromMatchersAndTime matchers now =
+fromMatchersAndTime : String -> List Utils.Filter.Matcher -> Time -> SilenceForm
+fromMatchersAndTime defaultCreator matchers now =
     { empty
         | startsAt = initialField (timeToString now)
         , endsAt = initialField (timeToString (now + defaultDuration))
-        , duration = initialField (durationFormat defaultDuration)
+        , duration = initialField (durationFormat defaultDuration |> Maybe.withDefault "")
+        , createdBy = initialField defaultCreator
         , matchers =
             -- If no matchers were specified, add an empty row
             if List.isEmpty matchers then
                 [ emptyMatcher ]
             else
-                List.map fromMatcher matchers
+                List.filterMap (filterMatcherToMatcher >> Maybe.map fromMatcher) matchers
     }
 
 
 appendMatcher : MatcherForm -> Result String (List Matcher) -> Result String (List Matcher)
 appendMatcher { isRegex, name, value } =
     Result.map2 (::)
-        (Result.map2 (Matcher isRegex) (stringNotEmpty name.value) (stringNotEmpty value.value))
+        (Result.map2 (Matcher isRegex) (stringNotEmpty name.value) (Ok value.value))
+
+
+filterMatcherToMatcher : Utils.Filter.Matcher -> Maybe Matcher
+filterMatcherToMatcher { key, op, value } =
+    Maybe.map (\op -> Matcher op key value) <|
+        case op of
+            Utils.Filter.Eq ->
+                Just False
+
+            Utils.Filter.RegexMatch ->
+                Just True
+
+            -- we don't support negative matchers
+            _ ->
+                Nothing
 
 
 fromMatcher : Matcher -> MatcherForm

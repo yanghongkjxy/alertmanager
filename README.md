@@ -31,7 +31,7 @@ You can either `go get` it:
 ```
 $ GO15VENDOREXPERIMENT=1 go get github.com/prometheus/alertmanager/cmd/...
 # cd $GOPATH/src/github.com/prometheus/alertmanager
-$ alertmanager -config.file=<your_file>
+$ alertmanager --config.file=<your_file>
 ```
 
 Or checkout the source code and build manually:
@@ -42,7 +42,7 @@ $ cd $GOPATH/src/github.com/prometheus
 $ git clone https://github.com/prometheus/alertmanager.git
 $ cd alertmanager
 $ make build
-$ ./alertmanager -config.file=<your_file>
+$ ./alertmanager --config.file=<your_file>
 ```
 
 You can also build just one of the binaries in this repo by passing a name to the build function:
@@ -150,13 +150,13 @@ inhibit_rules:
 receivers:
 - name: 'team-X-mails'
   email_configs:
-  - to: 'team-X+alerts@example.org'
+  - to: 'team-X+alerts@example.org, team-Y+alerts@example.org'
 
 - name: 'team-X-pager'
   email_configs:
   - to: 'team-X+alerts-critical@example.org'
   pagerduty_configs:
-  - service_key: <team-X-key>
+  - routing_key: <team-X-key>
 
 - name: 'team-Y-mails'
   email_configs:
@@ -164,11 +164,11 @@ receivers:
 
 - name: 'team-Y-pager'
   pagerduty_configs:
-  - service_key: <team-Y-key>
+  - routing_key: <team-Y-key>
 
 - name: 'team-DB-pager'
   pagerduty_configs:
-  - service_key: <team-DB-key>
+  - routing_key: <team-DB-key>
 ```
 
 ## Amtool
@@ -268,6 +268,7 @@ $ amtool silence expire $(amtool silence query -q)
 Amtool allows a config file to specify some options for convenience. The default config file paths are `$HOME/.config/amtool/config.yml` or `/etc/amtool/config.yml`
 
 An example configfile might look like the following:
+
 ```
 # Define the path that amtool can find your `alertmanager` instance at
 alertmanager.url: "http://localhost:9093"
@@ -276,7 +277,7 @@ alertmanager.url: "http://localhost:9093"
 author: me@example.com
 
 # Force amtool to give you an error if you don't include a comment on a silence
-comment_require: true
+comment_required: true
 
 # Set a default output format. (unset defaults to simple)
 output: extended
@@ -288,34 +289,43 @@ output: extended
 
 To create a highly available cluster of the Alertmanager the instances need to
 be configured to communicate with each other. This is configured using the
-`-mesh.*` flags.
+`--cluster.*` flags.
 
-- `-mesh.peer-id` string: mesh peer ID (default "&lt;hardware-mac-address&gt;")
-- `-mesh.listen-address` string: mesh listen address (default "0.0.0.0:6783")
-- `-mesh.nickname` string: mesh peer nickname (default "&lt;machine-hostname&gt;")
-- `-mesh.peer` value: initial peers (repeat flag for each additional peer)
+- `--cluster.listen-address` string: cluster listen address (default "0.0.0.0:9094")
+- `--cluster.advertise-address` string: cluster advertise address
+- `--cluster.peer` value: initial peers (repeat flag for each additional peer)
+- `--cluster.peer-timeout` value: peer timeout period (default "15s")
+- `--cluster.gossip-interval` value: cluster message propagation speed
+  (default "200ms")
+- `--cluster.pushpull-interval` value: lower values will increase
+  convergence speeds at expense of bandwidth (default "1m0s")
+- `--cluster.settle-timeout` value: maximum time to wait for cluster
+  connections to settle before evaluating notifications.
+- `--cluster.tcp-timeout` value: timeout value for tcp connections, reads and writes (default "10s")
+- `--cluster.probe-timeout` value: time to wait for ack before marking node unhealthy
+  (default "500ms")
+- `--cluster.probe-interval` value: interval between random node probes (default "1s")
 
-The `mesh.peer-id` flag is used as a unique ID among the peers. It defaults to
-the MAC address, therefore the default value should typically be a good option.
-
-The same applies to the default of the `mesh.nickname` flag, as it defaults to
-the hostname.
-
-The chosen port in the `mesh.listen-address` flag is the port that needs to be
-specified in the `mesh.peer` flag of the other peers.
+The chosen port in the `cluster.listen-address` flag is the port that needs to be
+specified in the `cluster.peer` flag of the other peers.
 
 To start a cluster of three peers on your local machine use `goreman` and the
 Procfile within this repository.
 
 	goreman start
 
-To point your prometheus instance to multiple Alertmanagers use the
-`-alertmanager.url` parameter. It allows passing in a comma separated list.
-Start your prometheus like this, for example:
+To point your Prometheus 1.4, or later, instance to multiple Alertmanagers, configure them
+in your `prometheus.yml` configuration file, for example:
 
-	./prometheus -config.file=prometheus.yml -alertmanager.url http://localhost:9095,http://localhost:9094,http://localhost:9093
-
-> Note: make sure to have a valid `prometheus.yml` in your current directory
+```yaml
+alerting:
+  alertmanagers:
+  - static_configs:
+    - targets:
+      - alertmanager1:9093
+      - alertmanager2:9093
+      - alertmanager3:9093
+```
 
 > Important: Do not load balance traffic between Prometheus and its Alertmanagers, but instead point Prometheus to a list of all Alertmanagers. The Alertmanager implementation expects all alerts to be sent to all Alertmanagers to ensure high availability.
 

@@ -34,6 +34,7 @@ import (
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
+	commoncfg "github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/version"
 	"golang.org/x/net/context"
@@ -117,6 +118,10 @@ func BuildReceiverIntegrations(nc *config.Receiver, tmpl *template.Template, log
 		n := NewOpsGenie(c, tmpl, logger)
 		add("opsgenie", i, n, c)
 	}
+	for i, c := range nc.WechatConfigs {
+		n := NewWechat(c, tmpl, logger)
+		add("wechat", i, n, c)
+	}
 	for i, c := range nc.SlackConfigs {
 		n := NewSlack(c, tmpl, logger)
 		add("slack", i, n, c)
@@ -142,15 +147,14 @@ var userAgentHeader = fmt.Sprintf("Alertmanager/%s", version.Version)
 
 // Webhook implements a Notifier for generic webhooks.
 type Webhook struct {
-	// The URL to which notifications are sent.
-	URL    string
+	conf   *config.WebhookConfig
 	tmpl   *template.Template
 	logger log.Logger
 }
 
 // NewWebhook returns a new Webhook.
 func NewWebhook(conf *config.WebhookConfig, t *template.Template, l log.Logger) *Webhook {
-	return &Webhook{URL: conf.URL, tmpl: t, logger: l}
+	return &Webhook{conf: conf, tmpl: t, logger: l}
 }
 
 // WebhookMessage defines the JSON object send to webhook endpoints.
@@ -182,14 +186,19 @@ func (w *Webhook) Notify(ctx context.Context, alerts ...*types.Alert) (bool, err
 		return false, err
 	}
 
-	req, err := http.NewRequest("POST", w.URL, &buf)
+	req, err := http.NewRequest("POST", w.conf.URL, &buf)
 	if err != nil {
 		return true, err
 	}
 	req.Header.Set("Content-Type", contentTypeJSON)
 	req.Header.Set("User-Agent", userAgentHeader)
 
-	resp, err := ctxhttp.Do(ctx, http.DefaultClient, req)
+	c, err := commoncfg.NewHTTPClientFromConfig(w.conf.HTTPConfig)
+	if err != nil {
+		return false, err
+	}
+
+	resp, err := ctxhttp.Do(ctx, c, req)
 	if err != nil {
 		return true, err
 	}
@@ -202,7 +211,7 @@ func (w *Webhook) retry(statusCode int) (bool, error) {
 	// Webhooks are assumed to respond with 2xx response codes on a successful
 	// request and 5xx response codes are assumed to be recoverable.
 	if statusCode/100 != 2 {
-		return (statusCode/100 == 5), fmt.Errorf("unexpected status code %v from %s", statusCode, w.URL)
+		return (statusCode/100 == 5), fmt.Errorf("unexpected status code %v from %s", statusCode, w.conf.URL)
 	}
 
 	return false, nil
@@ -438,18 +447,108 @@ const (
 )
 
 type pagerDutyMessage struct {
-	ServiceKey  string            `json:"service_key"`
-	IncidentKey string            `json:"incident_key"`
-	EventType   string            `json:"event_type"`
-	Description string            `json:"description"`
+	RoutingKey  string            `json:"routing_key,omitempty"`
+	ServiceKey  string            `json:"service_key,omitempty"`
+	DedupKey    string            `json:"dedup_key,omitempty"`
+	IncidentKey string            `json:"incident_key,omitempty"`
+	EventType   string            `json:"event_type,omitempty"`
+	Description string            `json:"description,omitempty"`
+	EventAction string            `json:"event_action"`
+	Payload     *pagerDutyPayload `json:"payload"`
 	Client      string            `json:"client,omitempty"`
 	ClientURL   string            `json:"client_url,omitempty"`
 	Details     map[string]string `json:"details,omitempty"`
 }
 
+type pagerDutyPayload struct {
+	Summary       string            `json:"summary"`
+	Source        string            `json:"source"`
+	Severity      string            `json:"severity"`
+	Timestamp     string            `json:"timestamp,omitempty"`
+	Class         string            `json:"class,omitempty"`
+	Component     string            `json:"component,omitempty"`
+	Group         string            `json:"group,omitempty"`
+	CustomDetails map[string]string `json:"custom_details,omitempty"`
+}
+
+func (n *PagerDuty) notifyV1(ctx context.Context, c *http.Client, eventType, key string, tmpl func(string) string, details map[string]string, as ...*types.Alert) (bool, error) {
+
+	msg := &pagerDutyMessage{
+		ServiceKey:  tmpl(string(n.conf.ServiceKey)),
+		EventType:   eventType,
+		IncidentKey: hashKey(key),
+		Description: tmpl(n.conf.Description),
+		Details:     details,
+	}
+
+	n.conf.URL = "https://events.pagerduty.com/generic/2010-04-15/create_event.json"
+
+	if eventType == pagerDutyEventTrigger {
+		msg.Client = tmpl(n.conf.Client)
+		msg.ClientURL = tmpl(n.conf.ClientURL)
+	}
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(msg); err != nil {
+		return false, err
+	}
+
+	resp, err := ctxhttp.Post(ctx, c, n.conf.URL, contentTypeJSON, &buf)
+	if err != nil {
+		return true, err
+	}
+	defer resp.Body.Close()
+
+	return n.retryV1(resp.StatusCode)
+}
+
+func (n *PagerDuty) notifyV2(ctx context.Context, c *http.Client, eventType, key string, tmpl func(string) string, details map[string]string, as ...*types.Alert) (bool, error) {
+	if n.conf.Severity == "" {
+		n.conf.Severity = "error"
+	}
+
+	var payload *pagerDutyPayload
+	if eventType == pagerDutyEventTrigger {
+		payload = &pagerDutyPayload{
+			Summary:       tmpl(n.conf.Description),
+			Source:        tmpl(n.conf.Client),
+			Severity:      tmpl(n.conf.Severity),
+			CustomDetails: details,
+			Class:         tmpl(n.conf.Class),
+			Component:     tmpl(n.conf.Component),
+			Group:         tmpl(n.conf.Group),
+		}
+	}
+
+	msg := &pagerDutyMessage{
+		RoutingKey:  tmpl(string(n.conf.RoutingKey)),
+		EventAction: eventType,
+		DedupKey:    hashKey(key),
+		Payload:     payload,
+	}
+
+	if eventType == pagerDutyEventTrigger {
+		msg.Client = tmpl(n.conf.Client)
+		msg.ClientURL = tmpl(n.conf.ClientURL)
+	}
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(msg); err != nil {
+		return false, err
+	}
+
+	resp, err := ctxhttp.Post(ctx, c, n.conf.URL, contentTypeJSON, &buf)
+	if err != nil {
+		return true, err
+	}
+	defer resp.Body.Close()
+
+	return n.retryV2(resp.StatusCode)
+}
+
 // Notify implements the Notifier interface.
 //
-// http://developer.pagerduty.com/documentation/integration/events/trigger
+// https://v2.developer.pagerduty.com/docs/events-api-v2
 func (n *PagerDuty) Notify(ctx context.Context, as ...*types.Alert) (bool, error) {
 	key, ok := GroupKey(ctx)
 	if !ok {
@@ -474,41 +573,38 @@ func (n *PagerDuty) Notify(ctx context.Context, as ...*types.Alert) (bool, error
 		details[k] = tmpl(v)
 	}
 
-	msg := &pagerDutyMessage{
-		ServiceKey:  tmpl(string(n.conf.ServiceKey)),
-		EventType:   eventType,
-		IncidentKey: hashKey(key),
-		Description: tmpl(n.conf.Description),
-		Details:     details,
-	}
-	if eventType == pagerDutyEventTrigger {
-		msg.Client = tmpl(n.conf.Client)
-		msg.ClientURL = tmpl(n.conf.ClientURL)
-	}
 	if err != nil {
 		return false, err
 	}
 
-	var buf bytes.Buffer
-	if err := json.NewEncoder(&buf).Encode(msg); err != nil {
+	c, err := commoncfg.NewHTTPClientFromConfig(n.conf.HTTPConfig)
+	if err != nil {
 		return false, err
 	}
 
-	resp, err := ctxhttp.Post(ctx, http.DefaultClient, n.conf.URL, contentTypeJSON, &buf)
-	if err != nil {
-		return true, err
+	if n.conf.ServiceKey != "" {
+		return n.notifyV1(ctx, c, eventType, key, tmpl, details, as...)
 	}
-	resp.Body.Close()
-
-	return n.retry(resp.StatusCode)
+	return n.notifyV2(ctx, c, eventType, key, tmpl, details, as...)
 }
 
-func (n *PagerDuty) retry(statusCode int) (bool, error) {
+func (n *PagerDuty) retryV1(statusCode int) (bool, error) {
 	// Retrying can solve the issue on 403 (rate limiting) and 5xx response codes.
 	// 2xx response codes indicate a successful request.
 	// https://v2.developer.pagerduty.com/docs/trigger-events
 	if statusCode/100 != 2 {
 		return (statusCode == 403 || statusCode/100 == 5), fmt.Errorf("unexpected status code %v", statusCode)
+	}
+
+	return false, nil
+}
+
+func (n *PagerDuty) retryV2(statusCode int) (bool, error) {
+	// Retrying can solve the issue on 429 (rate limiting) and 5xx response codes.
+	// 2xx response codes indicate a successful request.
+	// https://v2.developer.pagerduty.com/docs/events-api-v2#api-response-codes--retry-logic
+	if statusCode/100 != 2 {
+		return (statusCode == 429 || statusCode/100 == 5), fmt.Errorf("unexpected status code %v", statusCode)
 	}
 
 	return false, nil
@@ -542,21 +638,17 @@ type slackReq struct {
 
 // slackAttachment is used to display a richly-formatted message block.
 type slackAttachment struct {
-	Title     string `json:"title,omitempty"`
-	TitleLink string `json:"title_link,omitempty"`
-	Pretext   string `json:"pretext,omitempty"`
-	Text      string `json:"text"`
-	Fallback  string `json:"fallback"`
+	Title     string               `json:"title,omitempty"`
+	TitleLink string               `json:"title_link,omitempty"`
+	Pretext   string               `json:"pretext,omitempty"`
+	Text      string               `json:"text"`
+	Fallback  string               `json:"fallback"`
+	Fields    []config.SlackField  `json:"fields,omitempty"`
+	Actions   []config.SlackAction `json:"actions,omitempty"`
+	Footer    string               `json:"footer"`
 
 	Color    string   `json:"color,omitempty"`
 	MrkdwnIn []string `json:"mrkdwn_in,omitempty"`
-}
-
-// slackAttachmentField is displayed in a table inside the message attachment.
-type slackAttachmentField struct {
-	Title string `json:"title"`
-	Value string `json:"value"`
-	Short bool   `json:"short,omitempty"`
 }
 
 // Notify implements the Notifier interface.
@@ -573,9 +665,47 @@ func (n *Slack) Notify(ctx context.Context, as ...*types.Alert) (bool, error) {
 		Pretext:   tmplText(n.conf.Pretext),
 		Text:      tmplText(n.conf.Text),
 		Fallback:  tmplText(n.conf.Fallback),
+		Footer:    tmplText(n.conf.Footer),
 		Color:     tmplText(n.conf.Color),
 		MrkdwnIn:  []string{"fallback", "pretext", "text"},
 	}
+
+	var numFields = len(n.conf.Fields)
+	if numFields > 0 {
+		var fields = make([]config.SlackField, numFields)
+		for index, field := range n.conf.Fields {
+			// Check if short was defined for the field otherwise fallback to the global setting
+			var short bool
+			if field.Short != nil {
+				short = *field.Short
+			} else {
+				short = n.conf.ShortFields
+			}
+
+			// Rebuild the field by executing any templates and setting the new value for short
+			fields[index] = config.SlackField{
+				Title: tmplText(field.Title),
+				Value: tmplText(field.Value),
+				Short: &short,
+			}
+		}
+		attachment.Fields = fields
+	}
+
+	var numActions = len(n.conf.Actions)
+	if numActions > 0 {
+		var actions = make([]config.SlackAction, numActions)
+		for index, action := range n.conf.Actions {
+			actions[index] = config.SlackAction{
+				Type:  tmplText(action.Type),
+				Text:  tmplText(action.Text),
+				URL:   tmplText(action.URL),
+				Style: tmplText(action.Style),
+			}
+		}
+		attachment.Actions = actions
+	}
+
 	req := &slackReq{
 		Channel:     tmplText(n.conf.Channel),
 		Username:    tmplText(n.conf.Username),
@@ -593,7 +723,12 @@ func (n *Slack) Notify(ctx context.Context, as ...*types.Alert) (bool, error) {
 		return false, err
 	}
 
-	resp, err := ctxhttp.Post(ctx, http.DefaultClient, string(n.conf.APIURL), contentTypeJSON, &buf)
+	c, err := commoncfg.NewHTTPClientFromConfig(n.conf.HTTPConfig)
+	if err != nil {
+		return false, err
+	}
+
+	resp, err := ctxhttp.Post(ctx, c, string(n.conf.APIURL), contentTypeJSON, &buf)
 	if err != nil {
 		return true, err
 	}
@@ -670,7 +805,12 @@ func (n *Hipchat) Notify(ctx context.Context, as ...*types.Alert) (bool, error) 
 		return false, err
 	}
 
-	resp, err := ctxhttp.Post(ctx, http.DefaultClient, url, contentTypeJSON, &buf)
+	c, err := commoncfg.NewHTTPClientFromConfig(n.conf.HTTPConfig)
+	if err != nil {
+		return false, err
+	}
+
+	resp, err := ctxhttp.Post(ctx, c, url, contentTypeJSON, &buf)
 	if err != nil {
 		return true, err
 	}
@@ -691,6 +831,166 @@ func (n *Hipchat) retry(statusCode int) (bool, error) {
 	return false, nil
 }
 
+// Wechat implements a Notfier for wechat notifications
+type Wechat struct {
+	conf   *config.WechatConfig
+	tmpl   *template.Template
+	logger log.Logger
+
+	accessToken   string
+	accessTokenAt time.Time
+}
+
+// Wechat AccessToken with corpid and corpsecret.
+type WechatToken struct {
+	AccessToken string `json:"access_token"`
+}
+
+type weChatMessage struct {
+	Text    weChatMessageContent `yaml:"text,omitempty" json:"text,omitempty"`
+	ToUser  string               `yaml:"touser,omitempty" json:"touser,omitempty"`
+	ToParty string               `yaml:"toparty,omitempty" json:"toparty,omitempty"`
+	Totag   string               `yaml:"totag,omitempty" json:"totag,omitempty"`
+	AgentID string               `yaml:"agentid,omitempty" json:"agentid,omitempty"`
+	Safe    string               `yaml:"safe,omitempty" json:"safe,omitempty"`
+	Type    string               `yaml:"msgtype,omitempty" json:"msgtype,omitempty"`
+}
+
+type weChatMessageContent struct {
+	Content string `json:"content"`
+}
+
+type weChatResponse struct {
+	Code  int    `json:"code"`
+	Error string `json:"error"`
+}
+
+// NewWechat returns a new Wechat notifier.
+func NewWechat(c *config.WechatConfig, t *template.Template, l log.Logger) *Wechat {
+	return &Wechat{conf: c, tmpl: t, logger: l}
+}
+
+// Notify implements the Notifier interface.
+func (n *Wechat) Notify(ctx context.Context, as ...*types.Alert) (bool, error) {
+	key, ok := GroupKey(ctx)
+	if !ok {
+		return false, fmt.Errorf("group key missing")
+	}
+
+	level.Debug(n.logger).Log("msg", "Notifying Wechat", "incident", key)
+	data := n.tmpl.Data(receiverName(ctx, n.logger), groupLabels(ctx, n.logger), as...)
+
+	var err error
+	tmpl := tmplText(n.tmpl, data, &err)
+	if err != nil {
+		return false, err
+	}
+
+	c, err := commoncfg.NewHTTPClientFromConfig(n.conf.HTTPConfig)
+	if err != nil {
+		return false, err
+	}
+
+	// Refresh AccessToken over 2 hours
+	if n.accessToken == "" || time.Now().Sub(n.accessTokenAt) > 2*time.Hour {
+		parameters := url.Values{}
+		parameters.Add("corpsecret", tmpl(string(n.conf.APISecret)))
+		parameters.Add("corpid", tmpl(string(n.conf.CorpID)))
+
+		apiURL := n.conf.APIURL + "gettoken"
+
+		u, err := url.Parse(apiURL)
+		if err != nil {
+			return false, err
+		}
+
+		u.RawQuery = parameters.Encode()
+
+		level.Debug(n.logger).Log("msg", "Sending Wechat message", "incident", key, "url", u.String())
+
+		req, err := http.NewRequest(http.MethodGet, u.String(), nil)
+		if err != nil {
+			return true, err
+		}
+
+		req.Header.Set("Content-Type", contentTypeJSON)
+
+		resp, err := c.Do(req.WithContext(ctx))
+		if err != nil {
+			return true, err
+		}
+		defer resp.Body.Close()
+
+		var wechatToken WechatToken
+		if err := json.NewDecoder(resp.Body).Decode(&wechatToken); err != nil {
+			return false, err
+		}
+
+		if wechatToken.AccessToken == "" {
+			return false, fmt.Errorf("invalid APISecret for CorpID: %s", n.conf.CorpID)
+		}
+
+		// Cache accessToken
+		n.accessToken = wechatToken.AccessToken
+		n.accessTokenAt = time.Now()
+	}
+
+	msg := &weChatMessage{
+		Text: weChatMessageContent{
+			Content: tmpl(n.conf.Message),
+		},
+		ToUser:  tmpl(n.conf.ToUser),
+		ToParty: tmpl(n.conf.ToParty),
+		Totag:   tmpl(n.conf.ToTag),
+		AgentID: tmpl(n.conf.AgentID),
+		Type:    "text",
+		Safe:    "0",
+	}
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(msg); err != nil {
+		return false, err
+	}
+
+	postMessageURL := n.conf.APIURL + "message/send?access_token=" + n.accessToken
+
+	req, err := http.NewRequest(http.MethodPost, postMessageURL, &buf)
+	if err != nil {
+		return true, err
+	}
+
+	resp, err := c.Do(req.WithContext(ctx))
+	if err != nil {
+		return true, err
+	}
+	defer resp.Body.Close()
+
+	body, _ := ioutil.ReadAll(resp.Body)
+	level.Debug(n.logger).Log("msg", "response: "+string(body), "incident", key)
+
+	if resp.StatusCode != 200 {
+		return true, fmt.Errorf("unexpected status code %v", resp.StatusCode)
+	} else {
+		var weResp weChatResponse
+		if err := json.Unmarshal(body, &weResp); err != nil {
+			return true, err
+		}
+
+		// https://work.weixin.qq.com/api/doc#10649
+		if weResp.Code == 0 {
+			return false, nil
+		}
+
+		// AccessToken is expired
+		if weResp.Code == 42001 {
+			n.accessToken = ""
+			return true, errors.New(weResp.Error)
+		}
+
+		return false, errors.New(weResp.Error)
+	}
+}
+
 // OpsGenie implements a Notifier for OpsGenie notifications.
 type OpsGenie struct {
 	conf   *config.OpsGenieConfig
@@ -703,37 +1003,61 @@ func NewOpsGenie(c *config.OpsGenieConfig, t *template.Template, l log.Logger) *
 	return &OpsGenie{conf: c, tmpl: t, logger: l}
 }
 
-type opsGenieMessage struct {
-	APIKey string `json:"apiKey"`
-	Alias  string `json:"alias"`
-}
-
 type opsGenieCreateMessage struct {
-	*opsGenieMessage `json:",inline"`
-
-	Message     string            `json:"message"`
-	Description string            `json:"description,omitempty"`
-	Details     map[string]string `json:"details"`
-	Source      string            `json:"source"`
-	Teams       string            `json:"teams,omitempty"`
-	Tags        string            `json:"tags,omitempty"`
-	Note        string            `json:"note,omitempty"`
+	Alias       string              `json:"alias"`
+	Message     string              `json:"message"`
+	Description string              `json:"description,omitempty"`
+	Details     map[string]string   `json:"details"`
+	Source      string              `json:"source"`
+	Teams       []map[string]string `json:"teams,omitempty"`
+	Tags        []string            `json:"tags,omitempty"`
+	Note        string              `json:"note,omitempty"`
+	Priority    string              `json:"priority,omitempty"`
 }
 
 type opsGenieCloseMessage struct {
-	*opsGenieMessage `json:",inline"`
-}
-
-type opsGenieErrorResponse struct {
-	Code  int    `json:"code"`
-	Error string `json:"error"`
+	Source string `json:"source"`
 }
 
 // Notify implements the Notifier interface.
 func (n *OpsGenie) Notify(ctx context.Context, as ...*types.Alert) (bool, error) {
+	req, retry, err := n.createRequest(ctx, as...)
+	if err != nil {
+		return retry, err
+	}
+
+	c, err := commoncfg.NewHTTPClientFromConfig(n.conf.HTTPConfig)
+	if err != nil {
+		return false, err
+	}
+
+	resp, err := ctxhttp.Do(ctx, c, req)
+
+	if err != nil {
+		return true, err
+	}
+	defer resp.Body.Close()
+
+	return n.retry(resp.StatusCode)
+}
+
+// Like Split but filter out empty strings.
+func safeSplit(s string, sep string) []string {
+	a := strings.Split(strings.TrimSpace(s), sep)
+	b := a[:0]
+	for _, x := range a {
+		if x != "" {
+			b = append(b, x)
+		}
+	}
+	return b
+}
+
+// Create requests for a list of alerts.
+func (n *OpsGenie) createRequest(ctx context.Context, as ...*types.Alert) (*http.Request, bool, error) {
 	key, ok := GroupKey(ctx)
 	if !ok {
-		return false, fmt.Errorf("group key missing")
+		return nil, false, fmt.Errorf("group key missing")
 	}
 	data := n.tmpl.Data(receiverName(ctx, n.logger), groupLabels(ctx, n.logger), as...)
 
@@ -750,82 +1074,66 @@ func (n *OpsGenie) Notify(ctx context.Context, as ...*types.Alert) (bool, error)
 	var (
 		msg    interface{}
 		apiURL string
-
-		apiMsg = opsGenieMessage{
-			APIKey: string(n.conf.APIKey),
-			Alias:  hashKey(key),
-		}
+		alias  = hashKey(key)
 		alerts = types.Alerts(as...)
 	)
 	switch alerts.Status() {
 	case model.AlertResolved:
-		apiURL = n.conf.APIHost + "v1/json/alert/close"
-		msg = &opsGenieCloseMessage{&apiMsg}
+		apiURL = fmt.Sprintf("%sv2/alerts/%s/close?identifierType=alias", n.conf.APIURL, alias)
+		msg = &opsGenieCloseMessage{Source: tmpl(n.conf.Source)}
 	default:
 		message := tmpl(n.conf.Message)
 		if len(message) > 130 {
-			message = message[:127]+"..."
+			message = message[:127] + "..."
 			level.Debug(n.logger).Log("msg", "Truncated message to %q due to OpsGenie message limit", "truncated_message", message, "incident", key)
 		}
 
-		apiURL = n.conf.APIHost + "v1/json/alert"
+		apiURL = n.conf.APIURL + "v2/alerts"
+		var teams []map[string]string
+		for _, t := range safeSplit(string(tmpl(n.conf.Teams)), ",") {
+			teams = append(teams, map[string]string{"name": t})
+		}
+		tags := safeSplit(string(tmpl(n.conf.Tags)), ",")
+
 		msg = &opsGenieCreateMessage{
-			opsGenieMessage: &apiMsg,
-			Message:         message,
-			Description:     tmpl(n.conf.Description),
-			Details:         details,
-			Source:          tmpl(n.conf.Source),
-			Teams:           tmpl(n.conf.Teams),
-			Tags:            tmpl(n.conf.Tags),
-			Note:            tmpl(n.conf.Note),
+			Alias:       alias,
+			Message:     message,
+			Description: tmpl(n.conf.Description),
+			Details:     details,
+			Source:      tmpl(n.conf.Source),
+			Teams:       teams,
+			Tags:        tags,
+			Note:        tmpl(n.conf.Note),
+			Priority:    tmpl(n.conf.Priority),
 		}
 	}
 	if err != nil {
-		return false, fmt.Errorf("templating error: %s", err)
+		return nil, false, fmt.Errorf("templating error: %s", err)
 	}
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(msg); err != nil {
-		return false, err
+		return nil, false, err
 	}
 
-	resp, err := ctxhttp.Post(ctx, http.DefaultClient, apiURL, contentTypeJSON, &buf)
+	req, err := http.NewRequest("POST", apiURL, &buf)
 	if err != nil {
-		return true, err
+		return nil, true, err
 	}
-	defer resp.Body.Close()
+	req.Header.Set("Content-Type", contentTypeJSON)
+	req.Header.Set("Authorization", fmt.Sprintf("GenieKey %s", n.conf.APIKey))
+	return req, true, nil
+}
 
-	// Missing documentation therefore assuming only 5xx response codes are
-	// recoverable.
-	if resp.StatusCode/100 == 5 {
-		return true, fmt.Errorf("unexpected status code %v", resp.StatusCode)
-	} else if resp.StatusCode == 400 && alerts.Status() == model.AlertResolved {
-		body, _ := ioutil.ReadAll(resp.Body)
-
-		var responseMessage opsGenieErrorResponse
-		if err := json.Unmarshal(body, &responseMessage); err != nil {
-			return false, fmt.Errorf("could not parse error response %q", body)
-		}
-		const alreadyClosedError = 5
-		if responseMessage.Code == alreadyClosedError {
-			return false, nil
-		}
-		return false, fmt.Errorf("error when closing alert: code %d, error %q",
-			responseMessage.Code, responseMessage.Error)
-	} else if resp.StatusCode/100 == 4 {
-		return false, fmt.Errorf("unexpected status code %v", resp.StatusCode)
-	} else if resp.StatusCode/100 != 2 {
-		body, _ := ioutil.ReadAll(resp.Body)
-		level.Debug(n.logger).Log(
-			"msg", "Unexpected OpsGenie response",
-			"incident", key,
-			"url", apiURL,
-			"posted_message", msg,
-			"status", resp.Status,
-			"response_body", body,
-		)
-		return false, fmt.Errorf("unexpected status code %v", resp.StatusCode)
+func (n *OpsGenie) retry(statusCode int) (bool, error) {
+	// https://docs.opsgenie.com/docs/response#section-response-codes
+	// Response codes 429 (rate limiting) and 5xx are potentially recoverable
+	if statusCode/100 == 5 || statusCode == 429 {
+		return true, fmt.Errorf("unexpected status code %v", statusCode)
+	} else if statusCode/100 != 2 {
+		return false, fmt.Errorf("unexpected status code %v", statusCode)
 	}
+
 	return false, nil
 }
 
@@ -858,11 +1166,6 @@ type victorOpsMessage struct {
 	MonitoringTool    string `json:"monitoring_tool"`
 }
 
-type victorOpsErrorResponse struct {
-	Result  string `json:"result"`
-	Message string `json:"message"`
-}
-
 // Notify implements the Notifier interface.
 func (n *VictorOps) Notify(ctx context.Context, as ...*types.Alert) (bool, error) {
 	victorOpsAllowedEvents := map[string]bool{
@@ -881,7 +1184,7 @@ func (n *VictorOps) Notify(ctx context.Context, as ...*types.Alert) (bool, error
 		alerts       = types.Alerts(as...)
 		data         = n.tmpl.Data(receiverName(ctx, n.logger), groupLabels(ctx, n.logger), as...)
 		tmpl         = tmplText(n.tmpl, data, &err)
-		apiURL       = fmt.Sprintf("%s%s/%s", n.conf.APIURL, n.conf.APIKey, n.conf.RoutingKey)
+		apiURL       = fmt.Sprintf("%s%s/%s", n.conf.APIURL, n.conf.APIKey, tmpl(n.conf.RoutingKey))
 		messageType  = tmpl(n.conf.MessageType)
 		stateMessage = tmpl(n.conf.StateMessage)
 	)
@@ -916,38 +1219,28 @@ func (n *VictorOps) Notify(ctx context.Context, as ...*types.Alert) (bool, error
 		return false, err
 	}
 
-	resp, err := ctxhttp.Post(ctx, http.DefaultClient, apiURL, contentTypeJSON, &buf)
+	c, err := commoncfg.NewHTTPClientFromConfig(n.conf.HTTPConfig)
+	if err != nil {
+		return false, err
+	}
+
+	resp, err := ctxhttp.Post(ctx, c, apiURL, contentTypeJSON, &buf)
 	if err != nil {
 		return true, err
 	}
 
 	defer resp.Body.Close()
 
+	return n.retry(resp.StatusCode)
+}
+
+func (n *VictorOps) retry(statusCode int) (bool, error) {
 	// Missing documentation therefore assuming only 5xx response codes are
 	// recoverable.
-	if resp.StatusCode/100 == 5 {
-		return true, fmt.Errorf("unexpected status code %v", resp.StatusCode)
-	}
-
-	if resp.StatusCode/100 != 2 {
-		body, _ := ioutil.ReadAll(resp.Body)
-
-		var responseMessage victorOpsErrorResponse
-		if err := json.Unmarshal(body, &responseMessage); err != nil {
-			return false, fmt.Errorf("could not parse error response %q", body)
-		}
-
-		level.Debug(n.logger).Log(
-			"msg", "Unexpected VictorOps response",
-			"incident", key,
-			"url", apiURL,
-			"posted_message", msg,
-			"status", resp.Status,
-			"response_body", body,
-		)
-
-		return false, fmt.Errorf("error when posting alert: result %q, message %q",
-			responseMessage.Result, responseMessage.Message)
+	if statusCode/100 == 5 {
+		return true, fmt.Errorf("unexpected status code %v", statusCode)
+	} else if statusCode/100 != 2 {
+		return false, fmt.Errorf("unexpected status code %v", statusCode)
 	}
 
 	return false, nil
@@ -1001,12 +1294,12 @@ func (n *Pushover) Notify(ctx context.Context, as ...*types.Alert) (bool, error)
 	}
 	parameters.Add("message", message)
 
-	supplementaryUrl := tmpl(n.conf.URL)
-	if len(supplementaryUrl) > 512 {
-		supplementaryUrl = supplementaryUrl[:509] + "..."
-		level.Debug(n.logger).Log("msg", "Truncated URL due to Pushover url limit", "truncated_url", supplementaryUrl, "incident", key)
+	supplementaryURL := tmpl(n.conf.URL)
+	if len(supplementaryURL) > 512 {
+		supplementaryURL = supplementaryURL[:509] + "..."
+		level.Debug(n.logger).Log("msg", "Truncated URL due to Pushover url limit", "truncated_url", supplementaryURL, "incident", key)
 	}
-	parameters.Add("url", supplementaryUrl)
+	parameters.Add("url", supplementaryURL)
 
 	parameters.Add("priority", tmpl(n.conf.Priority))
 	parameters.Add("retry", fmt.Sprintf("%d", int64(time.Duration(n.conf.Retry).Seconds())))
@@ -1023,25 +1316,28 @@ func (n *Pushover) Notify(ctx context.Context, as ...*types.Alert) (bool, error)
 	u.RawQuery = parameters.Encode()
 	level.Debug(n.logger).Log("msg", "Sending Pushover message", "incident", key, "url", u.String())
 
-	resp, err := ctxhttp.Post(ctx, http.DefaultClient, u.String(), "text/plain", nil)
+	c, err := commoncfg.NewHTTPClientFromConfig(n.conf.HTTPConfig)
+	if err != nil {
+		return false, err
+	}
+
+	resp, err := ctxhttp.Post(ctx, c, u.String(), "text/plain", nil)
 	if err != nil {
 		return true, err
 	}
 	defer resp.Body.Close()
 
+	return n.retry(resp.StatusCode)
+}
+
+func (n *Pushover) retry(statusCode int) (bool, error) {
 	// Only documented behaviour is that 2xx response codes are successful and
 	// 4xx are unsuccessful, therefore assuming only 5xx are recoverable.
 	// https://pushover.net/api#response
-	if resp.StatusCode/100 == 5 {
-		return true, fmt.Errorf("unexpected status code %v", resp.StatusCode)
-	}
-
-	if resp.StatusCode/100 != 2 {
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			return false, err
-		}
-		return false, fmt.Errorf("unexpected status code %v (body: %s)", resp.StatusCode, string(body))
+	if statusCode/100 == 5 {
+		return true, fmt.Errorf("unexpected status code %v", statusCode)
+	} else if statusCode/100 != 2 {
+		return false, fmt.Errorf("unexpected status code %v", statusCode)
 	}
 
 	return false, nil

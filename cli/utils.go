@@ -1,13 +1,9 @@
 package cli
 
 import (
-	"errors"
 	"fmt"
 	"net/url"
-	"os"
-
-	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
+	"path"
 
 	"github.com/prometheus/alertmanager/pkg/parse"
 	"github.com/prometheus/alertmanager/types"
@@ -26,17 +22,14 @@ func (s ByAlphabetical) Less(i, j int) bool {
 		return s[i].Type < s[j].Type
 	} else if s[i].Value != s[j].Value {
 		return s[i].Value < s[j].Value
-	} else {
-		return false
 	}
+	return false
 }
 
-func GetAlertmanagerURL() (*url.URL, error) {
-	u, err := url.ParseRequestURI(viper.GetString("alertmanager.url"))
-	if err != nil {
-		return nil, errors.New("Invalid alertmanager url")
-	}
-	return u, nil
+func GetAlertmanagerURL(p string) url.URL {
+	amURL := *alertmanagerURL
+	amURL.Path = path.Join(alertmanagerURL.Path, p)
+	return amURL
 }
 
 // Parse a list of labels (cli arguments)
@@ -86,14 +79,4 @@ func TypeMatcher(matcher labels.Matcher) (types.Matcher, error) {
 		return types.Matcher{}, fmt.Errorf("invalid match type for creation operation: %s", matcher.Type)
 	}
 	return *typeMatcher, nil
-}
-
-func CommandWrapper(command func(*cobra.Command, []string) error) func(*cobra.Command, []string) {
-	return func(cmd *cobra.Command, args []string) {
-		err := command(cmd, args)
-		if err != nil {
-			fmt.Printf("Error: %s\n", err)
-			os.Exit(1)
-		}
-	}
 }

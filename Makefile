@@ -12,7 +12,9 @@
 # limitations under the License.
 
 GO    := GO15VENDOREXPERIMENT=1 go
-PROMU := $(GOPATH)/bin/promu
+FIRST_GOPATH := $(firstword $(subst :, ,$(shell $(GO) env GOPATH)))
+PROMU := $(FIRST_GOPATH)/bin/promu
+STATICCHECK := $(FIRST_GOPATH)/bin/staticcheck
 pkgs   = $(shell $(GO) list ./... | grep -v -E '/vendor/|/ui')
 
 PREFIX                  ?= $(shell pwd)
@@ -25,12 +27,14 @@ ifdef DEBUG
 	bindata_flags = -debug
 endif
 
+STATICCHECK_IGNORE = \
+  github.com/prometheus/alertmanager/notify/notify.go:SA6002
 
-all: format build test
+all: format staticcheck build test
 
 test:
 	@echo ">> running tests"
-	@$(GO) test -short $(pkgs)
+	@$(GO) test -race -short $(pkgs)
 
 style:
 	@echo ">> checking code style"
@@ -43,6 +47,10 @@ format:
 vet:
 	@echo ">> vetting code"
 	@$(GO) vet $(pkgs)
+
+staticcheck: $(STATICCHECK)
+	@echo ">> running staticcheck"
+	@$(STATICCHECK) -ignore "$(STATICCHECK_IGNORE)" $(pkgs)
 
 # Will only build the back-end
 build: promu
@@ -68,14 +76,14 @@ go-bindata:
 template/internal/deftmpl/bindata.go: template/default.tmpl
 	@go-bindata $(bindata_flags) -mode 420 -modtime 1 -pkg deftmpl -o template/internal/deftmpl/bindata.go template/default.tmpl
 
-ui/bindata.go: ui/app/script.js ui/app/index.html ui/lib
+ui/bindata.go: ui/app/script.js ui/app/index.html ui/app/lib
 # Using "-mode 420" and "-modtime 1" to make assets make target deterministic.
 # It sets all file permissions and time stamps to 420 and 1
 	@go-bindata $(bindata_flags) -mode 420 -modtime 1 -pkg ui -o \
 		ui/bindata.go ui/app/script.js \
 		ui/app/index.html \
 		ui/app/favicon.ico \
-		ui/lib/...
+		ui/app/lib/...
 
 ui/app/script.js: $(shell find ui/app/src -iname *.elm)
 	cd $(FRONTEND_DIR) && $(MAKE) script.js
@@ -85,6 +93,9 @@ promu:
 	GOARCH=$(subst x86_64,amd64,$(patsubst i%86,386,$(shell uname -m))) \
 	$(GO) get -u github.com/prometheus/promu
 
+$(FIRST_GOPATH)/bin/staticcheck:
+	@GOOS= GOARCH= $(GO) get -u honnef.co/go/tools/cmd/staticcheck
+
 proto:
 	scripts/genproto.sh
 
@@ -93,4 +104,4 @@ clean:
 	rm ui/bindata.go
 	cd $(FRONTEND_DIR) && $(MAKE) clean
 
-.PHONY: all style format build test vet assets tarball docker promu proto
+.PHONY: all style format build test vet assets tarball docker promu proto staticcheck
